@@ -1,0 +1,20 @@
+[package]
+name = "sshd_standalone"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2.3"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+rand = "0.10"
+anyhow = "1"
+shell-words = "1"
+bytes = "1"
+portable-pty = "0.9"
+
+[[bin]]
+name = "sshd_standalone"
+path = "src/main.rs"
