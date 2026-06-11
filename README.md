@@ -72,7 +72,7 @@ cargo ndk -P 23 -t arm64-v8a build --release
 > 交互式 shell 依赖 `openpty()`，而 Android 的 Bionic libc 从 **API level 23（Android 6.0）** 起才提供该函数。cargo-ndk 默认使用 API 21，会导致链接错误 `undefined symbol: openpty`。因此必须用 `-P 23`，且**编译出的二进制需要运行在 Android 6.0 及以上的设备**。
 
 > ⚠️ **关于 NDK 版本**
-> 部分 NDK（如 r23 beta）的 arm64 缺少 `libunwind.a`，编译 `arm64-v8a` 时会报 `unable to find library -lunwind`。若遇到，请改用稳定版 NDK（如 r25/r26），或先只编译 `armeabi-v7a`（其 `libunwind.a` 通常完整）。
+> 部分 NDK（如 r23 beta）的 arm64 缺少 `libunwind.a`，编译 `arm64-v8a` 时会报 `unable to find library -lunwind`。若遇到，请改用稳定版 NDK（如 r25( android-ndk-r25c-25.2.9519653 https://github.com/android/ndk/wiki/Unsupported-Downloads ) 或 r26），或先只编译 `armeabi-v7a`（其 `libunwind.a` 通常完整）。
 
 ---
 

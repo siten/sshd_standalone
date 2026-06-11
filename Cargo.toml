@@ -18,3 +18,9 @@ portable-pty = "0.9"
 [[bin]]
 name = "sshd_standalone"
 path = "src/main.rs"
+
+[profile.release]
+strip = true       # 自动剥离所有符号表和调试信息，让体积缩减到极致
+lto = true         # 顺便开启全局链接优化，进一步压缩体积、提升性能
+opt-level = "z"    # 优化目标改为“最小体积”（如果对体积极其敏感的话）
+
