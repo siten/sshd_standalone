@@ -10,12 +10,83 @@
 //! (open files and directory iterators) is kept in maps.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+/// Run SFTP while converting a closed SSH channel into EOF for russh-sftp.
+///
+/// russh-sftp 2.3 retries every stream error other than `UnexpectedEof`. A
+/// reset SSH connection therefore makes its detached server task spin forever
+/// and repeatedly log the same error. Treating stream errors as EOF lets that
+/// task terminate and drop the channel cleanly.
+pub async fn run<S>(stream: S, session: SftpSession)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    russh_sftp::server::run(DisconnectAsEof(stream), session).await;
+}
+
+struct DisconnectAsEof<S>(S);
+
+impl<S: AsyncRead + Unpin> AsyncRead for DisconnectAsEof<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match Pin::new(&mut self.get_mut().0).poll_read(cx, buf) {
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "SFTP SSH channel closed",
+            ))),
+            result => result,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for DisconnectAsEof<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.get_mut().0).poll_write(cx, buf) {
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "SFTP SSH channel closed",
+            ))),
+            result => result,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match Pin::new(&mut self.get_mut().0).poll_flush(cx) {
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "SFTP SSH channel closed",
+            ))),
+            result => result,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match Pin::new(&mut self.get_mut().0).poll_shutdown(cx) {
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "SFTP SSH channel closed",
+            ))),
+            result => result,
+        }
+    }
+}
 
 /// One open regular file, tracked by its handle id.
 struct OpenFile {

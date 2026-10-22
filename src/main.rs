@@ -256,15 +256,14 @@ impl Handler for ClientHandler {
                 }
             };
 
-            // Acknowledge the subsystem request, then hand the channel's byte
-            // stream to the SFTP server. `russh_sftp::server::run` spawns its
-            // own task that owns the stream and runs until the client sends
-            // EOF; it must NOT be followed by closing the channel here (doing
-            // so would tear down the session right after SSH_FXP_INIT).
+            // Acknowledge the subsystem request, then hand the channel stream
+            // to the SFTP server. It runs in its own task; the wrapper maps
+            // SSH disconnect errors to EOF so that task exits instead of
+            // retrying a reset stream indefinitely.
             session.channel_success(channel_id)?;
 
             let sftp = sftp::SftpSession::default();
-            russh_sftp::server::run(channel.into_stream(), sftp).await;
+            sftp::run(channel.into_stream(), sftp).await;
         } else {
             log::warn!("unsupported subsystem: {name}");
             session.channel_failure(channel_id)?;
@@ -438,8 +437,21 @@ async fn run_pty_shell(
         }
     });
 
-    // Task: forward PTY output to the SSH channel.
+    // The server invokes `Handler::data` for input, but russh also queues each
+    // inbound ChannelMsg on this Channel's receiver. Keep draining that queue:
+    // otherwise it fills after enough keystrokes and russh blocks its session
+    // loop while trying to enqueue the next message.
+    let mut channel = channel;
     let mut ch_writer = channel.make_writer();
+    let mut channel_task = tokio::spawn(async move {
+        while let Some(message) = channel.wait().await {
+            if matches!(message, russh::ChannelMsg::Close) {
+                break;
+            }
+        }
+    });
+
+    // Task: forward PTY output to the SSH channel.
     let out_task = tokio::spawn(async move {
         while let Some(chunk) = out_rx.recv().await {
             if ch_writer.write_all(&chunk).await.is_err() {
@@ -472,13 +484,24 @@ async fn run_pty_shell(
         // Closing in_tx ends writer_thread.
     });
 
-    // Wait for the child to exit on a blocking thread.
-    let exit = tokio::task::spawn_blocking(move || {
+    // Wait for the child to exit, but also stop it if the client closes this
+    // channel. Otherwise a dead SSH session can leave an interactive shell
+    // process running indefinitely.
+    let child_killer = child.clone_killer();
+    let mut child_wait = tokio::task::spawn_blocking(move || {
         let status = child.wait();
         status.map(|s| s.exit_code()).unwrap_or(1)
-    })
-    .await
-    .unwrap_or(1);
+    });
+    let exit = tokio::select! {
+        result = &mut child_wait => result.unwrap_or(1),
+        _ = &mut channel_task => {
+            let mut killer = child_killer;
+            let _ = killer.kill();
+            child_wait.await.unwrap_or(1)
+        }
+    };
+    channel_task.abort();
+    let _ = channel_task.await;
 
     // The child has exited: stop stdin forwarding first so PTY writer drops.
     // On some PTY backends, waiting for output before dropping input can hang
