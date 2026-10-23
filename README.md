@@ -1,6 +1,6 @@
 # sshd_standalone
 
-基于 [russh](https://github.com/warp-tech/russh) 0.61 实现的轻量级 SSH 服务器，支持密码认证、交互式 shell、远程命令执行以及 SCP 文件传输（含递归）。可在桌面平台（Windows/Linux/macOS）和 **Android** 上运行。
+基于 [russh](https://github.com/warp-tech/russh) 0.61 实现的轻量级 SSH 服务器，支持密码认证、交互式 shell、远程命令执行以及 SCP 文件传输（含递归）。可在桌面平台（Windows/Linux/macOS）、**Android** 和越狱 **iOS** 设备上运行。
 
 ## 功能
 
@@ -74,6 +74,52 @@ cargo ndk -P 23 -t arm64-v8a build --release
 > ⚠️ **关于 NDK 版本**
 > 部分 NDK（如 r23 beta）的 arm64 缺少 `libunwind.a`，编译 `arm64-v8a` 时会报 `unable to find library -lunwind`。若遇到，请改用稳定版 NDK（如 r25( android-ndk-r25c-25.2.9519653 https://github.com/android/ndk/wiki/Unsupported-Downloads ) 或 r26），或先只编译 `armeabi-v7a`（其 `libunwind.a` 通常完整）。
 
+### 3. 越狱 iOS（arm64 真机）
+
+iOS 设备目标为 `aarch64-apple-ios`。**仅添加 Rust target 不够**：Rust 标准库可以通过 rustup 安装，但链接需要 macOS 上的 Xcode/iPhoneOS SDK。Windows 上不能只靠 `rustup target add` 生成可运行的 iPhone Mach-O。
+
+在安装了**完整 Xcode**（包含 iPhoneOS SDK）的 macOS 上：
+
+```sh
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+rustup target add aarch64-apple-ios
+export SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+cargo build --release --target aarch64-apple-ios
+```
+
+产物：`target/aarch64-apple-ios/release/sshd_standalone`。这是 arm64 iOS **真机**目标，不是 iOS Simulator。常规情况下无需改 `Cargo.toml` 增加 target；target 是通过 `rustup target add` 安装，构建时用 `--target` 选择。首次构建应在 Mac/Xcode 环境完成，以确认当前依赖版本和 SDK 的链接兼容性。
+
+仓库提供 `.github/workflows/build-ios.yml`：在 GitHub 仓库的 **Actions → Build iOS arm64 binary → Run workflow** 手动启动构建，完成后从 workflow run 的 Artifacts 下载 `sshd_standalone-ios-arm64`。CI 只负责生成二进制；越狱设备上的 adhoc entitlement 签名仍按下文执行。
+
+#### 在 rootless 越狱设备部署
+
+本项目已按 iOS rootless/rootful 布局查找 `sh`：依次检查 `/system/bin/sh`、`/var/jb/bin/sh`、`/var/jb/usr/bin/sh`、`/bin/sh`、`/usr/bin/sh`、`/usr/local/bin/sh`，最后回退到 PATH 中的 `sh`。交互式 PTY 和远程命令执行共用该查找逻辑。
+
+host key 默认保存在可执行文件同目录的 `host_key` 文件中。传入 `--host-key PATH` 时先尝试指定路径；该路径不可用时回退到可执行文件同目录。两处都不可写时才使用仅驻留内存的临时密钥，并打印警告；这种情况下每次重启都会更换 SSH 主机身份。启动时会打印实际使用的文件绝对路径或临时密钥状态。守护进程的工作目录可能变化，因此 host key 按可执行文件位置确定，而不是当前工作目录。
+
+iOS 越狱仍会对 Mach-O 执行代码签名检查。对已实测的 Dopamine rootless（iOS 15.8.5）设备，二进制需使用带 `com.apple.private.security.no-container` entitlement 的 adhoc 签名；未签名、裸 `ldid -S` 或仅加 trustcache 都无法运行。这里的签名不需要 Apple 开发者证书，但每次替换二进制后都要重新签名。其他越狱方案/版本的 AMFI 行为可能不同。
+
+先在构建机创建 `sshd.entitlements`，内容如下：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.private.security.no-container</key><true/>
+</dict></plist>
+```
+
+通过现有 SSH/SCP 将程序和 plist 放到设备可写目录，然后在手机上签名并启动：
+
+```sh
+ldid -S/var/jb/var/mobile/sshd.entitlements /var/jb/var/mobile/sshd_standalone
+chmod +x /var/jb/var/mobile/sshd_standalone
+/var/jb/var/mobile/sshd_standalone --port 2222 --user admin --password yourpassword \
+  --host-key /var/jb/var/mobile/sshd_host_key
+```
+
+设备上的 `ldid` 可通过 Procursus 安装；对本次实测设备，`/var/jb/usr/bin/ldid` 已存在。端口 22 需要 root 权限，普通 `mobile` 用户使用 1024 以上端口（如 2222）。
+
 ---
 
 ## 二、运行
@@ -81,7 +127,7 @@ cargo ndk -P 23 -t arm64-v8a build --release
 ### 命令行参数
 
 ```
-sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password password] [--host-key host_key]
+sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password password] [--host-key PATH]
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -90,7 +136,7 @@ sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password passwo
 | `--port` | `2222` | 监听端口 |
 | `--user` | `admin` | 登录用户名 |
 | `--password` | `password` | 登录密码 |
-| `--host-key` | `host_key` | 主机密钥文件路径，不存在则自动生成并保存 |
+| `--host-key` | 可执行文件同目录的 `host_key` | 指定主机密钥文件；指定路径不可用时回退到可执行文件同目录，无可写路径时使用临时密钥 |
 
 日志级别可用环境变量 `RUST_LOG` 控制（默认 `info`）。
 

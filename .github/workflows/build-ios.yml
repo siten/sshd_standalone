@@ -1,0 +1,31 @@
+name: Build iOS arm64 binary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain and iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Build for iPhone
+        run: |
+          export SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          cargo build --release --target aarch64-apple-ios
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshd_standalone-ios-arm64
+          path: target/aarch64-apple-ios/release/sshd_standalone
+          if-no-files-found: error

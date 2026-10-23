@@ -367,18 +367,31 @@ fn build_shell_command() -> CommandBuilder {
     }
     #[cfg(not(windows))]
     {
-        // Prefer the Android system shell location, falling back to `sh` on PATH.
-        let shell = if std::path::Path::new("/system/bin/sh").exists() {
-            "/system/bin/sh"
-        } else {
-            "sh"
-        };
+        let shell = unix_shell_path();
         let mut cmd = CommandBuilder::new(shell);
         cmd.arg("-i");
         // Make interactive tools behave.
         cmd.env("TERM", "xterm-256color");
         cmd
     }
+}
+
+/// Find a usable POSIX shell on Unix platforms, including jailbreak layouts.
+/// Rootless jailbreaks commonly install the bootstrap under `/var/jb`, while
+/// rootful jailbreaks expose it through the traditional `/bin` and `/usr/bin`.
+#[cfg(not(windows))]
+fn unix_shell_path() -> &'static str {
+    [
+        "/system/bin/sh", // Android
+        "/var/jb/bin/sh", // iOS rootless bootstrap
+        "/var/jb/usr/bin/sh",
+        "/bin/sh", // system / rootful jailbreak
+        "/usr/bin/sh",
+        "/usr/local/bin/sh",
+    ]
+    .into_iter()
+    .find(|path| std::path::Path::new(path).is_file())
+    .unwrap_or("sh") // PATH fallback for desktop Unix and custom layouts
 }
 
 /// `spawn_command` consumes the builder by value; this helper moves it out of a
@@ -566,7 +579,7 @@ async fn run_command(channel: Channel<Msg>, command: &str) -> u32 {
         .stderr(std::process::Stdio::piped())
         .spawn();
     #[cfg(not(windows))]
-    let spawned = Command::new("sh")
+    let spawned = Command::new(unix_shell_path())
         .arg("-c")
         .arg(command)
         .stdout(std::process::Stdio::piped())
@@ -627,12 +640,12 @@ where
     }
 }
 
-fn parse_args() -> (String, u16, String, String, String) {
+fn parse_args() -> (String, u16, String, String, Option<String>) {
     let mut host = "0.0.0.0".to_string();
     let mut port: u16 = 2222;
     let mut user = "admin".to_string();
     let mut password = "password".to_string();
-    let mut host_key = "host_key".to_string();
+    let mut host_key = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -641,10 +654,10 @@ fn parse_args() -> (String, u16, String, String, String) {
             "--port" => port = args.next().and_then(|s| s.parse().ok()).unwrap_or(port),
             "--user" => user = args.next().unwrap_or(user),
             "--password" => password = args.next().unwrap_or(password),
-            "--host-key" => host_key = args.next().unwrap_or(host_key),
+            "--host-key" => host_key = args.next(),
             "-h" | "--help" => {
                 println!(
-                    "Usage: sshd_simple [--host 0.0.0.0] [--port 2222] [--user admin] [--password password] [--host-key host_key]"
+                    "Usage: sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password password] [--host-key PATH]"
                 );
                 std::process::exit(0);
             }
@@ -656,41 +669,113 @@ fn parse_args() -> (String, u16, String, String, String) {
     (host, port, user, password, host_key)
 }
 
-/// Load the server's host key from `path`, or generate and persist a new
-/// Ed25519 key there if the file does not exist yet. Persisting the key keeps
-/// the server's identity stable across restarts so clients don't get the
-/// "REMOTE HOST IDENTIFICATION HAS CHANGED" warning.
-fn load_or_create_host_key(path: &str) -> anyhow::Result<russh::keys::PrivateKey> {
+/// Load or create a persistent Ed25519 host key. Try the requested path first,
+/// then the executable's directory. If neither can be used, keep the key only
+/// in memory for this run.
+fn load_or_create_host_key(
+    explicit_path: Option<&str>,
+) -> anyhow::Result<(russh::keys::PrivateKey, Option<std::path::PathBuf>)> {
+    let mut candidates = Vec::new();
+    if let Some(path) = explicit_path {
+        candidates.push(std::path::PathBuf::from(path));
+    }
+    if let Some(path) = executable_host_key_path() {
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
+
+    for path in candidates {
+        if path.exists() {
+            match russh::keys::load_secret_key(&path, None) {
+                Ok(key) => return Ok((key, Some(displayable_path(&path)))),
+                Err(error) => log::warn!(
+                    "could not load host key '{}', trying fallback: {error}",
+                    path.display()
+                ),
+            }
+            continue;
+        }
+
+        match create_host_key_at(&path) {
+            Ok(()) => match russh::keys::load_secret_key(&path, None) {
+                Ok(key) => return Ok((key, Some(displayable_path(&path)))),
+                Err(error) => log::warn!(
+                    "could not load newly-created host key '{}': {error}",
+                    path.display()
+                ),
+            },
+            Err(error) => log::warn!(
+                "cannot persist host key at '{}', trying fallback: {error}",
+                path.display()
+            ),
+        }
+    }
+
+    log::warn!("host key is not persistent; using a new in-memory key for this run");
+    let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    Ok((key, None))
+}
+
+fn create_host_key_at(path: &std::path::Path) -> anyhow::Result<()> {
     use russh::keys::ssh_key::LineEnding;
 
-    if std::path::Path::new(path).exists() {
-        let key = russh::keys::load_secret_key(path, None)
-            .map_err(|e| anyhow::anyhow!("failed to load host key '{path}': {e}"))?;
-        log::info!("Loaded host key from {path}");
-        Ok(key)
-    } else {
-        let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
-        key.write_openssh_file(std::path::Path::new(path), LineEnding::LF)
-            .map_err(|e| anyhow::anyhow!("failed to write host key '{path}': {e}"))?;
-        // Best-effort: tighten permissions on Unix (ignored on Windows).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        log::info!("Generated new host key and saved to {path}");
-        Ok(key)
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
     }
+
+    let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    key.write_openssh_file(path, LineEnding::LF)
+        .map_err(|e| anyhow::anyhow!("failed to write host key '{}': {e}", path.display()))?;
+
+    // Best-effort: tighten permissions on Unix (ignored on Windows).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn displayable_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(path)
+        }
+    })
+}
+
+fn executable_host_key_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(|directory| directory.join("host_key"))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let (host, port, username, password, host_key_path) = parse_args();
+    let (host, port, username, password, host_key_override) = parse_args();
 
-    // Load a persistent host key (generate + save on first run).
-    let host_key = load_or_create_host_key(&host_key_path)?;
+    // Reuse or create a persistent host key, falling back to memory only when
+    // none of the default locations can be used.
+    let (host_key, host_key_path) = load_or_create_host_key(host_key_override.as_deref())?;
+    if let Some(path) = host_key_path {
+        println!("SSH host key file: {}", path.display());
+    } else {
+        println!(
+            "SSH host key: ephemeral (not persisted; clients will see a new key after restart)"
+        );
+        log::warn!("using ephemeral SSH host key; host identity changes after restart");
+    }
 
     let russh_config = russh::server::Config {
         inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
