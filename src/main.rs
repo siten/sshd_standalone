@@ -505,16 +505,18 @@ async fn run_pty_shell(
         let status = child.wait();
         status.map(|s| s.exit_code()).unwrap_or(1)
     });
-    let exit = tokio::select! {
-        result = &mut child_wait => result.unwrap_or(1),
+    let (exit, channel_task_finished) = tokio::select! {
+        result = &mut child_wait => (result.unwrap_or(1), false),
         _ = &mut channel_task => {
             let mut killer = child_killer;
             let _ = killer.kill();
-            child_wait.await.unwrap_or(1)
+            (child_wait.await.unwrap_or(1), true)
         }
     };
-    channel_task.abort();
-    let _ = channel_task.await;
+    if !channel_task_finished {
+        channel_task.abort();
+        let _ = channel_task.await;
+    }
 
     // The child has exited: stop stdin forwarding first so PTY writer drops.
     // On some PTY backends, waiting for output before dropping input can hang
