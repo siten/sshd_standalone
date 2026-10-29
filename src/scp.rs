@@ -8,10 +8,10 @@
 //!   * A single `\0` byte means "OK". A leading `\x01`/`\x02` byte followed by
 //!     text and `\n` means a (fatal) error/warning message.
 //!   * Control lines:
-//!       `C<mode> <size> <filename>\n`  - regular file follows
-//!       `D<mode> <size> <dirname>\n`   - enter directory (size ignored)
-//!       `E\n`                          - leave directory
-//!       `T<mtime> 0 <atime> 0\n`       - timestamps for the next entry (-p)
+//!     `C<mode> <size> <filename>\n`  - regular file follows
+//!     `D<mode> <size> <dirname>\n`   - enter directory (size ignored)
+//!     `E\n`                          - leave directory
+//!     `T<mtime> 0 <atime> 0\n`       - timestamps for the next entry (-p)
 
 use std::path::{Path, PathBuf};
 
@@ -120,10 +120,7 @@ async fn read_reply<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<()> {
         OK => Ok(()),
         WARN | ERR => {
             let msg = read_line(r).await?;
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("scp client reported: {msg}"),
-            ))
+            Err(std::io::Error::other(format!("scp client reported: {msg}")))
         }
         other => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -474,5 +471,5 @@ where
 }
 
 fn io_err(msg: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, msg.to_string())
+    std::io::Error::other(msg.to_string())
 }

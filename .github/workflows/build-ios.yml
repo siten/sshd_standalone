@@ -11,7 +11,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain and iOS target
         uses: dtolnay/rust-toolchain@stable
@@ -24,7 +24,7 @@ jobs:
           cargo build --release --target aarch64-apple-ios
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sshd_standalone-ios-arm64
           path: target/aarch64-apple-ios/release/sshd_standalone

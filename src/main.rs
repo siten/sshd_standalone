@@ -29,6 +29,9 @@ struct AppConfig {
     password: String,
 }
 
+/// Shared PTY master handle for a shell channel.
+type PtyMasterHandle = Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>;
+
 /// The top-level server. Produces a fresh `ClientHandler` per connection.
 #[derive(Clone)]
 struct AppServer {
@@ -46,7 +49,7 @@ impl russh::server::Server for AppServer {
             config: self.config.clone(),
             channels: Arc::new(Mutex::new(HashMap::new())),
             shell_stdin: Arc::new(Mutex::new(HashMap::new())),
-            pty_size: Arc::new(Mutex::new(HashMap::new())),
+            requested_pty: Arc::new(Mutex::new(HashMap::new())),
             pty_master: Arc::new(Mutex::new(HashMap::new())),
             authed_user: None,
         }
@@ -57,19 +60,26 @@ impl russh::server::Server for AppServer {
     }
 }
 
+/// `pty-req` parameters. The PTY is opened later, in `shell_request`.
+#[derive(Clone)]
+struct RequestedPty {
+    size: PtySize,
+    term: String,
+}
+
 /// Per-connection handler.
 struct ClientHandler {
     config: Arc<AppConfig>,
     /// Open session channels, so `exec_request` can take ownership of the
     /// `Channel` to drive command/SCP IO in a spawned task.
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
-    /// For interactive shell channels: a sender that forwards client keystrokes
-    /// (delivered via `data`) into the PTY master.
-    shell_stdin: Arc<Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Vec<u8>>>>>,
-    /// The requested PTY size per channel (set by `pty_request`).
-    pty_size: Arc<Mutex<HashMap<ChannelId, PtySize>>>,
+    /// Interactive keystrokes. Bounded so `data` can use `try_send` and never
+    /// block the session loop.
+    shell_stdin: Arc<Mutex<HashMap<ChannelId, mpsc::Sender<Vec<u8>>>>>,
+    /// Client terminal name and window size from `pty-req`.
+    requested_pty: Arc<Mutex<HashMap<ChannelId, RequestedPty>>>,
     /// The PTY master per shell channel, used to apply window resizes.
-    pty_master: Arc<Mutex<HashMap<ChannelId, Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>>>>,
+    pty_master: Arc<Mutex<HashMap<ChannelId, PtyMasterHandle>>>,
     authed_user: Option<String>,
 }
 
@@ -124,32 +134,33 @@ impl Handler for ClientHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.shell_stdin.lock().await.remove(&channel);
-        self.pty_size.lock().await.remove(&channel);
+        self.requested_pty.lock().await.remove(&channel);
         self.pty_master.lock().await.remove(&channel);
         self.channels.lock().await.remove(&channel);
         Ok(())
     }
 
-    /// Client keystrokes / piped stdin arrive here. For an interactive shell we
-    /// forward them to the PTY master (which echoes and feeds the shell).
+    /// Interactive keystrokes. russh also queues the same bytes on the channel;
+    /// the shell task discards that copy. `try_send` drops a chunk when the PTY
+    /// is not reading, so this handler does not stall the session loop.
     async fn data(
         &mut self,
         channel: ChannelId,
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(tx) = self.shell_stdin.lock().await.get(&channel) {
-            // Ignore send errors: the shell may have already exited.
-            let _ = tx.send(data.to_vec());
+        let tx = self.shell_stdin.lock().await.get(&channel).cloned();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(data.to_vec());
         }
         Ok(())
     }
 
-    /// Record the requested PTY size; the PTY itself is opened in `shell_request`.
+    /// Record the client terminal name and size. The PTY is opened in `shell_request`.
     async fn pty_request(
         &mut self,
         channel: ChannelId,
-        _term: &str,
+        term: &str,
         col_width: u32,
         row_height: u32,
         pix_width: u32,
@@ -157,13 +168,18 @@ impl Handler for ClientHandler {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let size = PtySize {
-            rows: row_height as u16,
-            cols: col_width as u16,
-            pixel_width: pix_width as u16,
-            pixel_height: pix_height as u16,
-        };
-        self.pty_size.lock().await.insert(channel, size);
+        self.requested_pty.lock().await.insert(
+            channel,
+            RequestedPty {
+                size: PtySize {
+                    rows: row_height as u16,
+                    cols: col_width as u16,
+                    pixel_width: pix_width as u16,
+                    pixel_height: pix_height as u16,
+                },
+                term: term.to_string(),
+            },
+        );
         session.channel_success(channel)?;
         Ok(())
     }
@@ -178,12 +194,12 @@ impl Handler for ClientHandler {
         pix_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let size = PtySize {
-            rows: if row_height == 0 { 24 } else { row_height as u16 },
-            cols: if col_width == 0 { 80 } else { col_width as u16 },
+        let size = clamp_pty_size(PtySize {
+            rows: row_height as u16,
+            cols: col_width as u16,
             pixel_width: pix_width as u16,
             pixel_height: pix_height as u16,
-        };
+        });
         if let Some(master) = self.pty_master.lock().await.get(&channel) {
             let master = master.clone();
             // resize is a quick blocking ioctl; run it on a blocking thread.
@@ -286,26 +302,14 @@ impl Handler for ClientHandler {
             }
         };
 
-        // Use the size requested via pty_request, or a sane default.
-        let mut size = self
-            .pty_size
-            .lock()
-            .await
-            .get(&channel_id)
-            .copied()
-            .unwrap_or(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
-        // A 0x0 size is invalid for ConPTY and some Unix PTYs; clamp it.
-        if size.rows == 0 {
-            size.rows = 24;
-        }
-        if size.cols == 0 {
-            size.cols = 80;
-        }
+        let requested = self.requested_pty.lock().await.get(&channel_id).cloned();
+        let size = clamp_pty_size(requested.as_ref().map(|pty| pty.size).unwrap_or(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }));
+        let term = requested.map(|pty| pty.term).unwrap_or_default();
 
         // Open a real PTY and spawn the shell on its slave end.
         let pty_pair = match native_pty_system().openpty(size) {
@@ -317,8 +321,7 @@ impl Handler for ClientHandler {
             }
         };
 
-        let mut cmd = build_shell_command();
-        let child = match pty_pair.slave.spawn_command(cmd_take(&mut cmd)) {
+        let child = match pty_pair.slave.spawn_command(build_shell_command(&term)) {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("failed to spawn shell: {e}");
@@ -338,8 +341,7 @@ impl Handler for ClientHandler {
 
         session.channel_success(channel_id)?;
 
-        // Channel to forward client keystrokes into the PTY master.
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(IO_CHUNKS);
         self.shell_stdin.lock().await.insert(channel_id, tx);
 
         let handle = session.handle();
@@ -359,90 +361,290 @@ impl Handler for ClientHandler {
     }
 }
 
-/// Build the shell `CommandBuilder` for the current platform.
-fn build_shell_command() -> CommandBuilder {
-    #[cfg(windows)]
-    {
-        CommandBuilder::new("cmd.exe")
+/// ConPTY and some Unix PTYs reject a 0x0 size.
+fn clamp_pty_size(mut size: PtySize) -> PtySize {
+    if size.rows == 0 {
+        size.rows = 24;
     }
-    #[cfg(not(windows))]
-    {
-        let shell = unix_shell_path();
-        let mut cmd = CommandBuilder::new(shell);
-        cmd.arg("-i");
-        // Make interactive tools behave.
-        cmd.env("TERM", "xterm-256color");
-        cmd
+    if size.cols == 0 {
+        size.cols = 80;
+    }
+    size
+}
+
+trait CommandEnv {
+    fn set_env(&mut self, key: &str, value: &str);
+    fn set_cwd(&mut self, dir: &std::path::Path);
+}
+
+impl CommandEnv for CommandBuilder {
+    fn set_env(&mut self, key: &str, value: &str) {
+        self.env(key, value);
+    }
+
+    fn set_cwd(&mut self, dir: &std::path::Path) {
+        self.cwd(dir);
     }
 }
 
-/// Find a usable POSIX shell on Unix platforms, including jailbreak layouts.
-/// Rootless jailbreaks commonly install the bootstrap under `/var/jb`, while
-/// rootful jailbreaks expose it through the traditional `/bin` and `/usr/bin`.
+impl CommandEnv for tokio::process::Command {
+    fn set_env(&mut self, key: &str, value: &str) {
+        self.env(key, value);
+    }
+
+    fn set_cwd(&mut self, dir: &std::path::Path) {
+        self.current_dir(dir);
+    }
+}
+
+/// Use the client terminal name when it is a plain terminfo name.
+fn shell_term(requested: &str) -> &str {
+    let safe = !requested.is_empty()
+        && requested.len() <= 128
+        && requested
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'));
+    if safe {
+        requested
+    } else {
+        "xterm-256color"
+    }
+}
+
+fn shell_program() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cmd.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        unix_shell_path()
+    }
+}
+
+/// Environment shared by the interactive shell and remote commands.
+/// `term` is set only for a PTY shell. `PATH` and `SHELL` are Unix-only.
+/// Both start in `session_cwd()`, which does not look up the SSH login name.
+fn apply_session_env(cmd: &mut impl CommandEnv, term: Option<&str>) {
+    if let Some(term) = term {
+        cmd.set_env("TERM", shell_term(term));
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.set_env("PATH", &unix_path());
+        cmd.set_env("SHELL", unix_shell_path());
+    }
+    cmd.set_cwd(&session_cwd());
+}
+
+/// Directory for a new session. The SSH username may not exist on the target,
+/// so this uses the process home when that directory is present, then a
+/// directory that does not depend on a user account.
+fn session_cwd() -> std::path::PathBuf {
+    fn existing_var(name: &str) -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(std::env::var_os(name)?);
+        path.is_dir().then_some(path)
+    }
+
+    #[cfg(windows)]
+    if let Some(path) = existing_var("USERPROFILE") {
+        return path;
+    }
+    if let Some(path) = existing_var("HOME") {
+        return path;
+    }
+    first_existing_dir(session_cwd_fallbacks())
+}
+
+fn session_cwd_fallbacks() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &[r"C:\"]
+    }
+    #[cfg(not(windows))]
+    {
+        &["/"]
+    }
+}
+
+/// First candidate that can be opened as a directory. The login name is not
+/// consulted; a missing or inaccessible path is skipped.
+fn first_existing_dir(candidates: &[&str]) -> std::path::PathBuf {
+    for dir in candidates {
+        let path = std::path::PathBuf::from(dir);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    std::path::PathBuf::from(candidates.last().copied().unwrap_or("."))
+}
+
+/// Build the interactive shell for the current platform.
+fn build_shell_command(term: &str) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new(shell_program());
+    #[cfg(not(windows))]
+    cmd.arg("-i");
+    apply_session_env(&mut cmd, Some(term));
+    cmd
+}
+
+/// Rootless Procursus and Android prefixes. A directory is added only when it
+/// can be opened and the inherited PATH does not already name it.
+#[cfg(not(windows))]
+const PLATFORM_PATH_DIRS: &[&str] = &[
+    "/var/jb/usr/local/sbin",
+    "/var/jb/usr/local/bin",
+    "/var/jb/usr/sbin",
+    "/var/jb/usr/bin",
+    "/var/jb/sbin",
+    "/var/jb/bin",
+    "/system/bin",
+    "/system/xbin",
+];
+
+/// login(1) directories. Each one is appended when it can be opened, including
+/// when the daemon already has a PATH, so a partial PATH still finds them.
+/// Inaccessible entries are left out, so this does not depend on the uid.
+#[cfg(not(windows))]
+const FALLBACK_PATH_DIRS: &[&str] = &[
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+];
+
+/// A non-login shell does not read `/etc/profile`, so the daemon supplies PATH.
+/// Order: platform prefixes → inherited dirs → fallback dirs (all deduplicated).
+#[cfg(not(windows))]
+fn assemble_path<'a, F>(
+    inherited: Option<&'a str>,
+    platform: &[&'a str],
+    fallback: &[&'a str],
+    mut accessible: F,
+) -> String
+where
+    F: FnMut(&str) -> bool,
+{
+    let inherited_dirs: Vec<&str> = inherited
+        .into_iter()
+        .flat_map(|path| path.split(':'))
+        .filter(|dir| !dir.is_empty())
+        .collect();
+
+    let mut dirs: Vec<&str> = Vec::new();
+    let mut push = |dir: &'a str| {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    };
+
+    for dir in platform {
+        if !inherited_dirs.contains(dir) && accessible(dir) {
+            push(dir);
+        }
+    }
+    for dir in inherited_dirs {
+        push(dir);
+    }
+    // Always append fallback dirs so partially-inherited PATHs stay complete.
+    for dir in fallback {
+        if accessible(dir) {
+            push(dir);
+        }
+    }
+    dirs.join(":")
+}
+
+#[cfg(not(windows))]
+fn unix_path() -> String {
+    let inherited = std::env::var("PATH").ok().filter(|path| !path.is_empty());
+    assemble_path(
+        inherited.as_deref(),
+        PLATFORM_PATH_DIRS,
+        FALLBACK_PATH_DIRS,
+        |dir| std::path::Path::new(dir).is_dir(),
+    )
+}
+
+/// Find a shell. Missing files and access errors are skipped.
+/// Full-featured shells come first. Minimal `sh` is only a last resort.
 #[cfg(not(windows))]
 fn unix_shell_path() -> &'static str {
     [
-        "/system/bin/sh", // Android
-        "/var/jb/bin/sh", // iOS rootless bootstrap
+        // zsh: rootless iOS login shell, and the usual shell on macOS.
+        "/var/jb/usr/bin/zsh",
+        "/bin/zsh",
+        "/usr/bin/zsh",
+        "/usr/local/bin/zsh",
+        // bash: usual full shell on Linux and rootful jailbreaks.
+        "/var/jb/usr/bin/bash",
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/usr/local/bin/bash",
+        // Android's own shell (mksh). Absent on the other platforms.
+        "/system/bin/sh",
+        // POSIX sh, including rootless dash. Enough to run a command.
+        "/var/jb/bin/sh",
         "/var/jb/usr/bin/sh",
-        "/bin/sh", // system / rootful jailbreak
+        "/bin/sh",
         "/usr/bin/sh",
         "/usr/local/bin/sh",
     ]
     .into_iter()
     .find(|path| std::path::Path::new(path).is_file())
-    .unwrap_or("sh") // PATH fallback for desktop Unix and custom layouts
+    .unwrap_or("sh")
 }
 
-/// `spawn_command` consumes the builder by value; this helper moves it out of a
-/// `&mut` binding (CommandBuilder is Clone, so we just clone it).
-fn cmd_take(cmd: &mut CommandBuilder) -> CommandBuilder {
-    cmd.clone()
-}
+/// Chunks queued between the SSH channel and a pipe. Further input is dropped
+/// so a client that keeps sending cannot stall the session loop.
+const IO_CHUNKS: usize = 32;
 
-/// Run an interactive shell over a real PTY, bridging the SSH channel.
+/// Interactive shell on a PTY.
 ///
-/// * client keystrokes (via `stdin_rx`) -> PTY master writer
-/// * PTY master reader -> SSH channel data
+/// Keystrokes arrive on `stdin_rx`. Channel EOF drops that sender, the PTY
+/// writer is dropped, and the shell sees EOF. Channel Close kills the child.
+/// The channel receiver is drained until then so russh can keep reading.
 async fn run_pty_shell(
-    channel: Channel<Msg>,
-    mut stdin_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut channel: Channel<Msg>,
+    stdin_rx: mpsc::Receiver<Vec<u8>>,
     master: Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
 ) -> u32 {
+    use std::io::Read;
     use tokio::io::AsyncWriteExt;
-    use std::io::{Read, Write};
 
-    // Obtain a blocking reader and writer from the PTY master.
     let reader = match master.lock().ok().and_then(|m| m.try_clone_reader().ok()) {
-        Some(r) => r,
+        Some(reader) => reader,
         None => {
             let _ = channel
                 .data_bytes(b"failed to obtain PTY reader\r\n".to_vec())
                 .await;
+            release_pty_child(child).await;
             return 1;
         }
     };
     let writer = match master.lock().ok().and_then(|m| m.take_writer().ok()) {
-        Some(w) => w,
+        Some(writer) => writer,
         None => {
             let _ = channel
                 .data_bytes(b"failed to obtain PTY writer\r\n".to_vec())
                 .await;
+            release_pty_child(child).await;
             return 1;
         }
     };
 
-    // Bridge PTY output -> SSH channel via a bounded async hand-off.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let reader_thread = std::thread::spawn(move || {
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(IO_CHUNKS);
+    let reader_task = tokio::task::spawn_blocking(move || {
         let mut reader = reader;
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if out_tx.send(buf[..n].to_vec()).is_err() {
+                    if out_tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
@@ -450,22 +652,16 @@ async fn run_pty_shell(
         }
     });
 
-    // The server invokes `Handler::data` for input, but russh also queues each
-    // inbound ChannelMsg on this Channel's receiver. Keep draining that queue:
-    // otherwise it fills after enough keystrokes and russh blocks its session
-    // loop while trying to enqueue the next message.
-    let mut channel = channel;
     let mut ch_writer = channel.make_writer();
     let mut channel_task = tokio::spawn(async move {
-        while let Some(message) = channel.wait().await {
-            if matches!(message, russh::ChannelMsg::Close) {
-                break;
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Close) | None => break,
+                Some(_) => {}
             }
         }
     });
-
-    // Task: forward PTY output to the SSH channel.
-    let out_task = tokio::spawn(async move {
+    let output_task = tokio::spawn(async move {
         while let Some(chunk) = out_rx.recv().await {
             if ch_writer.write_all(&chunk).await.is_err() {
                 break;
@@ -473,74 +669,69 @@ async fn run_pty_shell(
             let _ = ch_writer.flush().await;
         }
     });
+    let input_task = tokio::spawn(write_pty_input(stdin_rx, writer));
 
-    // Bridge SSH input -> PTY writer on a blocking thread.
-    let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let writer_thread = std::thread::spawn(move || {
-        let mut writer = writer;
-        while let Ok(bytes) = in_rx.recv() {
-            if writer.write_all(&bytes).is_err() {
-                break;
-            }
-            let _ = writer.flush();
-        }
-        // Dropping the writer sends EOF to the shell.
-    });
-
-    // Task: pull keystrokes off the async mpsc and push to the blocking writer.
-    let in_task = tokio::spawn(async move {
-        while let Some(bytes) = stdin_rx.recv().await {
-            if in_tx.send(bytes).is_err() {
-                break;
-            }
-        }
-        // Closing in_tx ends writer_thread.
-    });
-
-    // Wait for the child to exit, but also stop it if the client closes this
-    // channel. Otherwise a dead SSH session can leave an interactive shell
-    // process running indefinitely.
-    let child_killer = child.clone_killer();
+    let mut killer = child.clone_killer();
     let mut child_wait = tokio::task::spawn_blocking(move || {
-        let status = child.wait();
-        status.map(|s| s.exit_code()).unwrap_or(1)
+        child.wait().map(|status| status.exit_code()).unwrap_or(1)
     });
-    let (exit, channel_task_finished) = tokio::select! {
-        result = &mut child_wait => (result.unwrap_or(1), false),
+    let exit = tokio::select! {
+        biased;
+        result = &mut child_wait => result.unwrap_or(1),
         _ = &mut channel_task => {
-            let mut killer = child_killer;
             let _ = killer.kill();
-            (child_wait.await.unwrap_or(1), true)
+            child_wait.await.unwrap_or(1)
         }
     };
-    if !channel_task_finished {
+
+    // Drop the PTY writer before waiting on output. Some backends hang if the
+    // writer is still open while output is drained after the shell exits.
+    input_task.abort();
+    let _ = input_task.await;
+    // Close already completed this task inside `select`. Polling the same
+    // JoinHandle again panics. When the child exits first, abort drops the
+    // channel receiver so later client input cannot stall the session loop.
+    if !channel_task.is_finished() {
         channel_task.abort();
         let _ = channel_task.await;
     }
+    finish_pump(output_task).await;
+    // A read stuck in the kernel is not cancelled. Stop waiting after a moment.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reader_task).await;
+    exit
+}
 
-    // The child has exited: stop stdin forwarding first so PTY writer drops.
-    // On some PTY backends, waiting for output before dropping input can hang
-    // channel teardown after typing `exit`.
-    in_task.abort();
-    let _ = in_task.await;
-    let _ = writer_thread.join();
-
-    // Drain any final PTY output, but never block indefinitely.
-    match tokio::time::timeout(std::time::Duration::from_millis(500), out_task).await {
-        Ok(joined) => {
-            let _ = joined;
-        }
-        Err(_) => {
-            // Reader may be stuck in a backend-specific blocking read; detaching
-            // avoids wedging SSH channel close.
+async fn write_pty_input(
+    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+    mut writer: Box<dyn std::io::Write + Send>,
+) {
+    use std::io::Write;
+    while let Some(bytes) = stdin_rx.recv().await {
+        let written = tokio::task::spawn_blocking(move || {
+            let ok = writer.write_all(&bytes).is_ok() && writer.flush().is_ok();
+            (writer, ok)
+        })
+        .await;
+        match written {
+            Ok((restored, true)) => writer = restored,
+            Ok((restored, false)) => {
+                let _ = tokio::task::spawn_blocking(move || drop(restored)).await;
+                return;
+            }
+            Err(_) => return,
         }
     }
+    // Drop sends EOF to the shell. Do that off the runtime.
+    let _ = tokio::task::spawn_blocking(move || drop(writer)).await;
+}
 
-    // Do not join `reader_thread`: if backend read blocks forever, joining here
-    // would deadlock `shell_request` completion and the client would hang.
-    drop(reader_thread);
-
-    exit
+async fn release_pty_child(mut child: Box<dyn portable_pty::Child + Send + Sync>) {
+    let mut killer = child.clone_killer();
+    let _ = killer.kill();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = child.wait();
+    })
+    .await;
 }
 
 /// Run the SCP protocol over the channel. Returns an exit code.
@@ -567,54 +758,127 @@ async fn run_scp(channel: Channel<Msg>, cmd: scp::ScpCommand) -> u32 {
     }
 }
 
-/// Execute a shell command and stream stdout/stderr to the client.
-/// Returns the process exit code.
-async fn run_command(channel: Channel<Msg>, command: &str) -> u32 {
+/// Run one remote command. Stdin is the SSH channel. EOF closes that pipe.
+/// Close kills the child. Stdout and stderr are separate tasks.
+async fn run_command(mut channel: Channel<Msg>, command: &str) -> u32 {
     use tokio::process::Command;
 
-    // Spawn the command through the platform shell.
+    let mut cmd = Command::new(shell_program());
     #[cfg(windows)]
-    let spawned = Command::new("cmd")
-        .arg("/C")
-        .arg(command)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+    cmd.arg("/C");
     #[cfg(not(windows))]
-    let spawned = Command::new(unix_shell_path())
-        .arg("-c")
-        .arg(command)
+    cmd.arg("-c");
+    cmd.arg(command);
+    apply_session_env(&mut cmd, None);
+    let spawned = cmd
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();
 
     let mut child = match spawned {
-        Ok(c) => c,
-        Err(e) => {
+        Ok(child) => child,
+        Err(error) => {
             let _ = channel
-                .data_bytes(format!("failed to spawn command: {e}\r\n").into_bytes())
+                .data_bytes(format!("failed to spawn command: {error}\r\n").into_bytes())
                 .await;
             return 127;
         }
     };
 
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let out_task = tokio::spawn(pump(stdout, channel.make_writer()));
+    let err_task = tokio::spawn(pump(stderr, channel.make_writer_ext(Some(1))));
+    let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(IO_CHUNKS);
+    let mut stdin_tx = Some(stdin_tx);
+    let stdin_task = tokio::spawn(write_command_stdin(stdin_rx, stdin));
 
-    let writer = channel.make_writer();
-    let writer_err = channel.make_writer_ext(Some(1)); // ext code 1 = stderr
+    let exit_code = loop {
+        tokio::select! {
+            biased;
+            status = child.wait() => {
+                break match status {
+                    Ok(status) => process_exit_code(status),
+                    Err(_) => 1,
+                };
+            }
+            msg = channel.wait() => {
+                match msg {
+                    Some(russh::ChannelMsg::Data { data }) => {
+                        // `try_send` never waits. A full queue drops the chunk
+                        // so this arm cannot hide Close behind a blocked write.
+                        if let Some(tx) = stdin_tx.as_ref() {
+                            let _ = tx.try_send(data.to_vec());
+                        }
+                    }
+                    Some(russh::ChannelMsg::Eof) => {
+                        stdin_tx.take();
+                    }
+                    Some(russh::ChannelMsg::Close) | None => {
+                        stdin_tx.take();
+                        let _ = child.start_kill();
+                        break match child.wait().await {
+                            Ok(status) => process_exit_code(status),
+                            Err(_) => 1,
+                        };
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    };
 
-    // Pump stdout -> channel data, stderr -> channel extended data.
-    let out_task = tokio::spawn(pump(stdout, writer));
-    let err_task = tokio::spawn(pump(stderr, writer_err));
+    drop(stdin_tx);
+    drop(channel);
+    stdin_task.abort();
+    let _ = stdin_task.await;
+    finish_pump(out_task).await;
+    finish_pump(err_task).await;
+    exit_code
+}
 
-    let status = child.wait().await;
-    let _ = out_task.await;
-    let _ = err_task.await;
+async fn write_command_stdin(
+    mut inbound: mpsc::Receiver<Vec<u8>>,
+    mut stdin: Option<tokio::process::ChildStdin>,
+) {
+    use tokio::io::AsyncWriteExt;
+    while let Some(data) = inbound.recv().await {
+        let failed = match stdin.as_mut() {
+            Some(writer) => writer.write_all(&data).await.is_err() || writer.flush().await.is_err(),
+            None => false,
+        };
+        if failed {
+            stdin = None;
+        }
+    }
+    if let Some(mut writer) = stdin {
+        let _ = writer.shutdown().await;
+    }
+}
 
-    match status {
-        Ok(s) => s.code().unwrap_or(0) as u32,
-        Err(_) => 1,
+fn process_exit_code(status: std::process::ExitStatus) -> u32 {
+    if let Some(code) = status.code() {
+        return u32::try_from(code).unwrap_or(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return u32::try_from(signal).map_or(1, |s| 128u32.saturating_add(s));
+        }
+    }
+    1
+}
+
+async fn finish_pump(mut task: tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(std::time::Duration::from_millis(500), &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -804,4 +1068,67 @@ async fn main() -> anyhow::Result<()> {
         .run_on_socket(Arc::new(russh_config), &listener)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(windows))]
+    use super::{assemble_path, shell_term, FALLBACK_PATH_DIRS, PLATFORM_PATH_DIRS};
+    #[cfg(windows)]
+    use super::shell_term;
+
+    #[test]
+    fn term_uses_client_name_or_default() {
+        assert_eq!(shell_term("xterm-256color"), "xterm-256color");
+        assert_eq!(shell_term("tmux-256color"), "tmux-256color");
+        assert_eq!(shell_term(""), "xterm-256color");
+        assert_eq!(shell_term("xterm\nEVIL=1"), "xterm-256color");
+        assert_eq!(shell_term("a/b"), "xterm-256color");
+        assert_eq!(shell_term(&"x".repeat(129)), "xterm-256color");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn path_keeps_inherited_order_and_appends_fallback() {
+        let inherited = "/product/bin:/system/bin:/vendor/bin:";
+        let accessible =
+            |dir: &str| matches!(dir, "/var/jb/usr/bin" | "/system/bin" | "/bin" | "/usr/bin");
+        assert_eq!(
+            assemble_path(
+                Some(inherited),
+                PLATFORM_PATH_DIRS,
+                FALLBACK_PATH_DIRS,
+                accessible
+            ),
+            "/var/jb/usr/bin:/product/bin:/system/bin:/vendor/bin:/usr/bin:/bin"
+        );
+    }
+
+    #[test]
+    fn cwd_skips_a_home_that_does_not_exist() {
+        let fallback = if cfg!(windows) { r"C:\" } else { "/" };
+        let chosen = super::first_existing_dir(&["/no/such/admin/home", fallback]);
+        assert_eq!(chosen, std::path::PathBuf::from(fallback));
+        assert!(chosen.is_dir());
+    }
+
+    #[test]
+    fn session_cwd_is_an_existing_directory() {
+        assert!(super::session_cwd().is_dir());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn empty_path_uses_accessible_fallback_dirs() {
+        let accessible = |dir: &str| matches!(dir, "/usr/bin" | "/bin" | "/system/bin");
+        let expected = "/system/bin:/usr/bin:/bin";
+        assert_eq!(
+            assemble_path(None, PLATFORM_PATH_DIRS, FALLBACK_PATH_DIRS, accessible),
+            expected
+        );
+        assert_eq!(
+            assemble_path(Some(""), PLATFORM_PATH_DIRS, FALLBACK_PATH_DIRS, accessible),
+            expected
+        );
+    }
 }
