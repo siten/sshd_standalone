@@ -1,4 +1,4 @@
-//! A small SSH server built on [`russh`] (0.61) that supports:
+//! A small SSH server built on [`russh`] (0.65) that supports:
 //!   * password authentication,
 //!   * interactive shell (`ssh user@host`),
 //!   * remote command execution (`ssh user@host -p 2222 <command>`),
@@ -111,10 +111,13 @@ impl Handler for ClientHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.channels.lock().await.insert(channel.id(), channel);
-        Ok(true)
+        // Dropping the handle rejects the channel.
+        reply.accept().await;
+        Ok(())
     }
 
     async fn channel_eof(

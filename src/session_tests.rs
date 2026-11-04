@@ -30,7 +30,7 @@ impl russh::client::Handler for AcceptAll {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
@@ -128,7 +128,7 @@ impl CommandOutput {
 
 async fn exec(session: &ClientHandle, command: &str) -> Result<CommandOutput> {
     let mut channel = session.channel_open_session().await?;
-    channel.exec(true, command).await?;
+    channel.exec(true, command.as_bytes()).await?;
     finish_exec(&mut channel, COMMAND_TIMEOUT).await
 }
 
@@ -138,7 +138,7 @@ async fn exec_with_stdin(
     stdin: &[u8],
 ) -> Result<CommandOutput> {
     let mut channel = session.channel_open_session().await?;
-    channel.exec(true, command).await?;
+    channel.exec(true, command.as_bytes()).await?;
     channel.data_bytes(stdin.to_vec()).await?;
     channel.eof().await?;
     finish_exec(&mut channel, COMMAND_TIMEOUT).await

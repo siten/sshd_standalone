@@ -1,6 +1,6 @@
 # sshd_standalone
 
-基于 [russh](https://github.com/warp-tech/russh) 0.61 实现的轻量级 SSH 服务器，支持密码认证、交互式 shell、远程命令执行以及 SCP 文件传输（含递归）。可在桌面平台（Windows/Linux/macOS）、**Android** 和越狱 **iOS** 设备上运行。
+基于 [russh](https://github.com/warp-tech/russh) 0.65 实现的轻量级 SSH 服务器，支持密码认证、交互式 shell、远程命令执行以及 SCP 文件传输（含递归）。可在桌面平台（Windows/Linux/macOS）、**Android** 和越狱 **iOS** 设备上运行。
 
 ## 功能
 

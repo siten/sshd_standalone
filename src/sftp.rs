@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Run SFTP while converting a closed SSH channel into EOF for russh-sftp.
 ///
-/// russh-sftp 2.3 retries every stream error other than `UnexpectedEof`. A
+/// russh-sftp 3.0 retries every stream error other than `UnexpectedEof`. A
 /// reset SSH connection therefore makes its detached server task spin forever
 /// and repeatedly log the same error. Treating stream errors as EOF lets that
 /// task terminate and drop the channel cleanly.
