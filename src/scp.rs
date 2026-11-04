@@ -221,12 +221,7 @@ where
                 // A stray OK from the client; ignore.
             }
             other => {
-                send_error(
-                    stream,
-                    &format!("unexpected scp byte: 0x{other:02x}"),
-                    true,
-                )
-                .await?;
+                send_error(stream, &format!("unexpected scp byte: 0x{other:02x}"), true).await?;
                 return Err(io_err("unexpected scp control byte"));
             }
         }
@@ -350,12 +345,7 @@ where
     let meta = match tokio::fs::metadata(&cmd.path).await {
         Ok(m) => m,
         Err(e) => {
-            send_error(
-                stream,
-                &format!("{}: {}", cmd.path.display(), e),
-                false,
-            )
-            .await?;
+            send_error(stream, &format!("{}: {}", cmd.path.display(), e), false).await?;
             return Ok(());
         }
     };
@@ -426,12 +416,7 @@ where
 }
 
 /// Send a single regular file.
-async fn send_file<S>(
-    stream: &mut S,
-    path: &Path,
-    name: &str,
-    size: u64,
-) -> std::io::Result<()>
+async fn send_file<S>(stream: &mut S, path: &Path, name: &str, size: u64) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

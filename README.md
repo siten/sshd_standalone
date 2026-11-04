@@ -211,20 +211,17 @@ sshd_standalone/
 ├── src/
 │   ├── main.rs                 # 服务器、认证、命令执行、交互式 PTY shell
 │   ├── scp.rs                  # SCP 协议实现（上传 / 下载 / 递归）
+│   ├── session_tests.rs        # 集成测试，仅 cargo test 编译
 │   └── sftp.rs                 # sftp 实现
-└── examples/
-    └── test_client.rs          # 集成测试客户端（程序化验证各功能）
 ```
 
 ### 运行集成测试
 
 ```sh
-# 终端 1：启动服务器（默认端口 2222；测试客户端连接 2223，按需调整）
-./sshd_standalone --port 2223 --user admin --password password
-
-# 终端 2：运行测试客户端
-cargo run --example test_client
+cargo test
 ```
+
+`cargo test` 在进程内启动服务器，检查口令认证、远程命令及其标准输入和退出码、经典 SCP、交互式 shell、SFTP，以及通道队列排空和连接断开后的清理。
 
 ---
 

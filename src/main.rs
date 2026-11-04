@@ -15,10 +15,10 @@ mod sftp;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use russh::server::{Auth, Handler, Msg, Server as _, Session};
-use russh::{Channel, ChannelId};
-use russh::Pty;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use russh::server::{Auth, Handler, Msg, Server as _, Session};
+use russh::Pty;
+use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 
@@ -1060,7 +1060,11 @@ async fn main() -> anyhow::Result<()> {
     log::info!(
         "Login with: ssh {}@{} -p {}",
         server.config.username,
-        if host == "0.0.0.0" { "127.0.0.1" } else { &host },
+        if host == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            &host
+        },
         port
     );
 
@@ -1072,10 +1076,10 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(windows))]
-    use super::{assemble_path, shell_term, FALLBACK_PATH_DIRS, PLATFORM_PATH_DIRS};
     #[cfg(windows)]
     use super::shell_term;
+    #[cfg(not(windows))]
+    use super::{assemble_path, shell_term, FALLBACK_PATH_DIRS, PLATFORM_PATH_DIRS};
 
     #[test]
     fn term_uses_client_name_or_default() {
@@ -1118,6 +1122,30 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_code_uses_the_status_code() {
+        let mut command = std::process::Command::new(super::shell_program());
+        if cfg!(windows) {
+            command.args(["/C", "exit 42"]);
+        } else {
+            command.args(["-c", "exit 42"]);
+        }
+        let status = command.status().expect("spawn exit 42");
+        assert_eq!(super::process_exit_code(status), 42);
+    }
+
+    /// A signal death has no status code. Report the conventional 128+signal
+    /// value instead of collapsing every signal to 1.
+    #[test]
+    #[cfg(unix)]
+    fn signal_death_is_reported_as_128_plus_signal() {
+        let status = std::process::Command::new(super::shell_program())
+            .args(["-c", "kill -9 $$"])
+            .status()
+            .expect("spawn kill");
+        assert_eq!(super::process_exit_code(status), 137);
+    }
+
+    #[test]
     #[cfg(not(windows))]
     fn empty_path_uses_accessible_fallback_dirs() {
         let accessible = |dir: &str| matches!(dir, "/usr/bin" | "/bin" | "/system/bin");
@@ -1132,3 +1160,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod session_tests;

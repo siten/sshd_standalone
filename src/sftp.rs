@@ -181,7 +181,11 @@ impl russh_sftp::server::Handler for SftpSession {
         // Resolve the requested path to an absolute, canonical path. The
         // OpenSSH client sends "." initially and relies on the answer to set
         // the remote working directory.
-        let p = if path.is_empty() { ".".to_string() } else { path };
+        let p = if path.is_empty() {
+            ".".to_string()
+        } else {
+            path
+        };
         let resolved = std::fs::canonicalize(&p).unwrap_or_else(|_| {
             // If it doesn't exist yet, fall back to an absolute (lexical) path.
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
@@ -418,5 +422,227 @@ fn path_to_string(p: &Path) -> String {
         "/".to_string()
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    /// Every failed read, write, flush, and shutdown becomes UnexpectedEof.
+    /// russh-sftp exits its server loop only for that error.
+    #[tokio::test]
+    async fn disconnect_as_eof_rewrites_io_errors() {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_rewritten(kind).await;
+        }
+    }
+
+    async fn assert_rewritten(kind: io::ErrorKind) {
+        let mut stream = super::DisconnectAsEof(FailIo { kind });
+        assert_closed(stream.read(&mut [0u8; 4]).await.expect_err("read"));
+
+        let mut stream = super::DisconnectAsEof(FailIo { kind });
+        assert_closed(stream.write(&[1, 2, 3]).await.expect_err("write"));
+
+        let mut stream = super::DisconnectAsEof(FailIo { kind });
+        assert_closed(stream.flush().await.expect_err("flush"));
+
+        let mut stream = super::DisconnectAsEof(FailIo { kind });
+        assert_closed(stream.shutdown().await.expect_err("shutdown"));
+    }
+
+    fn assert_closed(error: io::Error) {
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "SFTP SSH channel closed");
+    }
+
+    /// Successful IO, including a zero-byte read, is passed through unchanged.
+    #[tokio::test]
+    async fn disconnect_as_eof_passes_successful_io() {
+        let mut stream = super::DisconnectAsEof(OkIo {
+            chunk: b"ok",
+            read: false,
+        });
+        let mut buf = [0u8; 4];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ok");
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(stream.write(b"abc").await.unwrap(), 3);
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    /// russh-sftp retries every stream error other than UnexpectedEof on a
+    /// detached task. A reset that stays a reset never returns to this sleep.
+    /// The occasional Pending only lets a broken loop be stopped and counted.
+    #[test]
+    fn sftp_reset_does_not_spin() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop_task = Arc::clone(&stop);
+
+        let worker = std::thread::Builder::new()
+            .name("sftp-reset".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("runtime");
+                let reads = Arc::new(AtomicUsize::new(0));
+                runtime.block_on(async move {
+                    let reads_for_send = Arc::clone(&reads);
+                    super::run(
+                        ResetStream {
+                            reads,
+                            stop: stop_task,
+                        },
+                        super::SftpSession::default(),
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let _ = tx.send(reads_for_send.load(Ordering::Relaxed));
+                });
+            })
+            .expect("spawn sftp reset thread");
+
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        stop.store(true, Ordering::Relaxed);
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+        match result {
+            Ok(reads) => assert!(
+                (1..=8).contains(&reads),
+                "a reset should end the sftp task on the first read, saw {reads} reads"
+            ),
+            Err(error) => panic!("sftp task kept running after connection reset: {error}"),
+        }
+    }
+
+    struct FailIo {
+        kind: io::ErrorKind,
+    }
+
+    impl AsyncRead for FailIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(self.kind, "boom")))
+        }
+    }
+
+    impl AsyncWrite for FailIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(self.kind, "boom")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(self.kind, "boom")))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(self.kind, "boom")))
+        }
+    }
+
+    struct OkIo {
+        chunk: &'static [u8],
+        read: bool,
+    }
+
+    impl AsyncRead for OkIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if !this.read {
+                let n = this.chunk.len().min(buf.remaining());
+                buf.put_slice(&this.chunk[..n]);
+                this.read = true;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for OkIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct ResetStream {
+        reads: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for ResetStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.stop.load(Ordering::Relaxed) {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stop")));
+            }
+            let n = self.reads.fetch_add(1, Ordering::Relaxed);
+            // Yield often enough that the runtime can finish the sleep and see
+            // `stop` when the wrapper is not installed. The first read stays
+            // ready so a working wrapper exits with a count of one.
+            if n > 0 && n % 64 == 0 {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "reset")))
+        }
+    }
+
+    impl AsyncWrite for ResetStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 }
