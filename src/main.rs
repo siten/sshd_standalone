@@ -329,6 +329,12 @@ impl Handler for ClientHandler {
             Err(e) => {
                 log::warn!("failed to spawn shell: {e}");
                 let _ = session.channel_failure(channel_id);
+                #[cfg(windows)]
+                {
+                    drop(pty_pair.slave);
+                    let master = Arc::new(std::sync::Mutex::new(pty_pair.master));
+                    finish_windows_pty(&master).await;
+                }
                 return Ok(());
             }
         };
@@ -604,6 +610,10 @@ fn unix_shell_path() -> &'static str {
 /// so a client that keeps sending cannot stall the session loop.
 const IO_CHUNKS: usize = 32;
 
+#[cfg(all(windows, test))]
+static WINDOWS_PTY_CLEANUPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Interactive shell on a PTY.
 ///
 /// Keystrokes arrive on `stdin_rx`. Channel EOF drops that sender, the PTY
@@ -625,6 +635,8 @@ async fn run_pty_shell(
                 .data_bytes(b"failed to obtain PTY reader\r\n".to_vec())
                 .await;
             release_pty_child(child).await;
+            #[cfg(windows)]
+            finish_windows_pty(&master).await;
             return 1;
         }
     };
@@ -635,6 +647,8 @@ async fn run_pty_shell(
                 .data_bytes(b"failed to obtain PTY writer\r\n".to_vec())
                 .await;
             release_pty_child(child).await;
+            #[cfg(windows)]
+            finish_windows_pty(&master).await;
             return 1;
         }
     };
@@ -699,9 +713,75 @@ async fn run_pty_shell(
         let _ = channel_task.await;
     }
     finish_pump(output_task).await;
-    // A read stuck in the kernel is not cancelled. Stop waiting after a moment.
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reader_task).await;
-    exit
+    #[cfg(windows)]
+    {
+        // The output receiver is gone, so a reader blocked on forwarding can
+        // exit. Shutdown cancels forwarding I/O, then drains the reserved output
+        // pipe concurrently with ClosePseudoConsole and joins both workers.
+        let closed = finish_windows_pty(&master).await;
+        let mut reader_task = reader_task;
+        let reader_finished = matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut reader_task).await,
+            Ok(Ok(()))
+        );
+        if !reader_finished {
+            reader_task.abort();
+            log::error!("PTY reader task did not finish after Windows pipe shutdown");
+        }
+        if closed && reader_finished {
+            #[cfg(test)]
+            WINDOWS_PTY_CLEANUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            log::debug!("PTY shutdown complete: output drained, pipes closed, ClosePseudoConsole returned, cleanup workers joined, reader task joined");
+            exit
+        } else {
+            1
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Preserve the existing Unix backend behavior.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reader_task).await;
+        exit
+    }
+}
+
+#[cfg(windows)]
+async fn finish_windows_pty(master: &PtyMasterHandle) -> bool {
+    use portable_pty::win::conpty::ConPtyMasterPty;
+    use std::time::Duration;
+
+    let shutdown = master.lock().ok().and_then(|master| {
+        let master: &dyn MasterPty = master.as_ref();
+        master
+            .downcast_ref::<ConPtyMasterPty>()
+            .map(ConPtyMasterPty::shutdown)
+    });
+    let Some(shutdown) = shutdown else {
+        log::error!("failed to obtain Windows PTY shutdown handle");
+        return false;
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match shutdown.try_wait() {
+            Ok(Some(status)) => {
+                log::debug!("Windows PTY cleanup completed: {status:?}");
+                return true;
+            }
+            Err(error) => {
+                log::error!(
+                    "Windows PTY cleanup failed: {error}; {:?}",
+                    shutdown.status()
+                );
+                return false;
+            }
+            Ok(None) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            log::error!("Windows PTY cleanup timed out: {:?}", shutdown.status());
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn write_pty_input(

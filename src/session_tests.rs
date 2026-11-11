@@ -874,6 +874,85 @@ async fn shell_channel_close_finishes_without_hanging() -> Result<()> {
     Ok(())
 }
 
+/// Unlike Shell, this client deliberately does not answer ESC[6n. Old conhost
+/// must be able to start and exit without a cursor report from the SSH client.
+#[cfg(windows)]
+#[tokio::test]
+async fn shell_starts_without_a_cursor_report_and_server_keeps_accepting() -> Result<()> {
+    let _guard = shell_gate().lock().await;
+    let server = start_server().await?;
+    let session = connect(server.addr).await?;
+    for _ in 0..3 {
+        let mut channel = session.channel_open_session().await?;
+        channel
+            .request_pty(true, "xterm", 200, 50, 0, 0, &[])
+            .await?;
+        channel.request_shell(true).await?;
+        channel
+            .data_bytes(b"echo NO_CURSOR_REPORT_OK\r\nexit 23\r\n".to_vec())
+            .await?;
+        let output = finish_exec(&mut channel, COMMAND_TIMEOUT).await?;
+        assert_eq!(output.code, 23, "{}", output.summary());
+        assert!(
+            output.stdout.contains("NO_CURSOR_REPORT_OK"),
+            "{}",
+            output.summary()
+        );
+        let fresh = tokio::time::timeout(COMMAND_TIMEOUT, connect(server.addr)).await??;
+        assert_eq!(exec(&fresh, "exit 0").await?.code, 0);
+    }
+    Ok(())
+}
+
+/// Keep the SSH output window small and stop consuming it while cmd floods
+/// output. A four-thread blocking pool makes leaked readers visible quickly.
+#[cfg(windows)]
+#[test]
+fn backpressured_shell_close_does_not_exhaust_the_blocking_pool() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(4)
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let _guard = shell_gate().lock().await;
+            let server = start_server().await?;
+            let config = Arc::new(russh::client::Config {
+                inactivity_timeout: Some(Duration::from_secs(120)),
+                nodelay: true,
+                window_size: 4096,
+                ..Default::default()
+            });
+            let mut session = russh::client::connect(config, server.addr, AcceptAll).await?;
+            assert!(session.authenticate_password("admin", "password").await?.success());
+            for _ in 0..12 {
+                let cleanups = super::WINDOWS_PTY_CLEANUPS.load(Ordering::SeqCst);
+                let mut channel = session.channel_open_session().await?;
+                channel.request_pty(true, "xterm", 200, 50, 0, 0, &[]).await?;
+                channel.request_shell(true).await?;
+                channel.data_bytes(b"for /L %i in (1,1,1000000) do @echo 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n".to_vec()).await?;
+                // Read once to establish that the shell started, then leave
+                // output unread so SSH forwarding and the PTY pump back up.
+                let _ = tokio::time::timeout(COMMAND_TIMEOUT, channel.wait()).await?;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                channel.close().await?;
+                drop(channel);
+                let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
+                while super::WINDOWS_PTY_CLEANUPS.load(Ordering::SeqCst) == cleanups {
+                    if tokio::time::Instant::now() >= deadline {
+                        bail!("Windows PTY cleanup did not complete after backpressured channel close");
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let fresh = tokio::time::timeout(COMMAND_TIMEOUT, connect(server.addr)).await??;
+                let output = tokio::time::timeout(COMMAND_TIMEOUT, exec(&fresh, "echo POOL_STILL_ALIVE")).await??;
+                assert_eq!(output.code, 0, "{}", output.summary());
+                assert!(output.stdout.contains("POOL_STILL_ALIVE"), "{}", output.summary());
+            }
+            Ok(())
+        })
+}
+
 /// Records a panic from the shell task. The default Tokio runtime does not
 /// fail a test when a spawned task panics.
 struct PanicWatch {
