@@ -1,15 +1,21 @@
 //! A small SSH server built on [`russh`] (0.65) that supports:
-//!   * password authentication,
+//!   * password, public key, and OpenSSH user-certificate authentication,
 //!   * interactive shell (`ssh user@host`),
 //!   * remote command execution (`ssh user@host -p 2222 <command>`),
 //!   * SCP upload/download including recursive (`scp`, `scp -r`).
 //!
 //! Usage:
-//!   cargo run -- [--port 2222] [--user admin] [--password secret]
+//!   cargo run -- [--port 2222] [--user admin] [--password secret] [--config server.conf]
 //!
-//! Defaults: 0.0.0.0:2222, user "admin", password "password".
+//! Without `--config`, only password login is enabled. Defaults: 0.0.0.0:2222,
+//! user "admin", password "password". With `--config`, each of `[public_keys]`,
+//! `[certificates]`, and `[passwords]` enables that method when it contains a
+//! valid entry. The command-line password is not used. `host`, `port`, and
+//! `host-key` before any section override those defaults. The same command-line
+//! flags override the file.
 
 mod scp;
+mod server_config;
 mod sftp;
 
 use std::collections::HashMap;
@@ -19,15 +25,11 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use russh::server::{Auth, Handler, Msg, Server as _, Session};
 use russh::Pty;
 use russh::{Channel, ChannelId};
+use server_config::{
+    host_key_candidates, parse_cli, resolve_startup, CliCommand, ServerConfig, HELP,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
-
-/// Shared, immutable server configuration (credentials etc.).
-#[derive(Clone)]
-struct AppConfig {
-    username: String,
-    password: String,
-}
 
 /// Shared PTY master handle for a shell channel.
 type PtyMasterHandle = Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>;
@@ -35,7 +37,7 @@ type PtyMasterHandle = Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>;
 /// The top-level server. Produces a fresh `ClientHandler` per connection.
 #[derive(Clone)]
 struct AppServer {
-    config: Arc<AppConfig>,
+    config: Arc<ServerConfig>,
 }
 
 impl russh::server::Server for AppServer {
@@ -52,6 +54,7 @@ impl russh::server::Server for AppServer {
             requested_pty: Arc::new(Mutex::new(HashMap::new())),
             pty_master: Arc::new(Mutex::new(HashMap::new())),
             authed_user: None,
+            authenticated_pty_allowed: false,
         }
     }
 
@@ -69,7 +72,7 @@ struct RequestedPty {
 
 /// Per-connection handler.
 struct ClientHandler {
-    config: Arc<AppConfig>,
+    config: Arc<ServerConfig>,
     /// Open session channels, so `exec_request` can take ownership of the
     /// `Channel` to drive command/SCP IO in a spawned task.
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
@@ -81,31 +84,90 @@ struct ClientHandler {
     /// The PTY master per shell channel, used to apply window resizes.
     pty_master: Arc<Mutex<HashMap<ChannelId, PtyMasterHandle>>>,
     authed_user: Option<String>,
+    authenticated_pty_allowed: bool,
+}
+
+fn reject_auth() -> Auth {
+    Auth::Reject {
+        proceed_with_methods: None,
+        partial_success: false,
+    }
 }
 
 impl Handler for ClientHandler {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        if user == self.config.username && password == self.config.password {
-            log::info!("User '{user}' authenticated via password");
+        if self.config.accepts_password(user, password) {
+            log::info!("User {user:?} authenticated via password");
             self.authed_user = Some(user.to_string());
+            self.authenticated_pty_allowed = true;
             Ok(Auth::Accept)
         } else {
-            log::warn!("Failed password auth for user '{user}'");
-            Ok(Auth::Reject {
-                proceed_with_methods: None,
-                partial_success: false,
-            })
+            log::warn!("Failed password auth for user {user:?}");
+            Ok(reject_auth())
         }
     }
 
-    /// Advertise that only password auth is offered.
+    /// Tell the client which configured methods it may try.
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
         Ok(Auth::Reject {
-            proceed_with_methods: Some(russh::MethodSet::from(&[russh::MethodKind::Password][..])),
+            proceed_with_methods: Some(self.config.method_set()),
             partial_success: false,
         })
+    }
+
+    async fn auth_publickey_offered(
+        &mut self,
+        _user: &str,
+        offer: russh::server::PublicKeyOffer<'_>,
+    ) -> Result<Auth, Self::Error> {
+        // A certificate probe only carries the certified key, not the CA.
+        // When certificate login is enabled, the offer has to proceed so the
+        // signed request can reach `auth_openssh_certificate`.
+        if self.config.accepts_public_key(offer.public_key) || self.config.allows_certificate() {
+            Ok(Auth::Accept)
+        } else {
+            Ok(reject_auth())
+        }
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: russh::server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        if self.config.accepts_public_key(key.public_key) {
+            log::info!("User {user:?} authenticated via public key");
+            self.authed_user = Some(user.to_string());
+            self.authenticated_pty_allowed = true;
+            Ok(Auth::Accept)
+        } else {
+            log::warn!("Failed public key auth for user {user:?}");
+            Ok(reject_auth())
+        }
+    }
+
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        certificate: &russh::keys::Certificate,
+    ) -> Result<Auth, Self::Error> {
+        match self.config.reject_certificate_reason(user, certificate) {
+            None => {
+                log::info!(
+                    "User {user:?} authenticated via certificate key ID {:?}",
+                    certificate.key_id()
+                );
+                self.authed_user = Some(user.to_string());
+                self.authenticated_pty_allowed = self.config.certificate_allows_pty(certificate);
+                Ok(Auth::Accept)
+            }
+            Some(reason) => {
+                log::warn!("Failed certificate auth for user {user:?}: {reason}");
+                Ok(reject_auth())
+            }
+        }
     }
 
     async fn channel_open_session(
@@ -171,6 +233,10 @@ impl Handler for ClientHandler {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if !self.authenticated_pty_allowed {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         self.requested_pty.lock().await.insert(
             channel,
             RequestedPty {
@@ -296,6 +362,11 @@ impl Handler for ClientHandler {
         channel_id: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if !self.authenticated_pty_allowed {
+            self.channels.lock().await.remove(&channel_id);
+            session.channel_failure(channel_id)?;
+            return Ok(());
+        }
         // Take ownership of the channel for the interactive session.
         let channel = match self.channels.lock().await.remove(&channel_id) {
             Some(c) => c,
@@ -989,81 +1060,59 @@ where
     }
 }
 
-fn parse_args() -> (String, u16, String, String, Option<String>) {
-    let mut host = "0.0.0.0".to_string();
-    let mut port: u16 = 2222;
-    let mut user = "admin".to_string();
-    let mut password = "password".to_string();
-    let mut host_key = None;
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--host" => host = args.next().unwrap_or(host),
-            "--port" => port = args.next().and_then(|s| s.parse().ok()).unwrap_or(port),
-            "--user" => user = args.next().unwrap_or(user),
-            "--password" => password = args.next().unwrap_or(password),
-            "--host-key" => host_key = args.next(),
-            "-h" | "--help" => {
-                println!(
-                    "Usage: sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password password] [--host-key PATH]"
-                );
-                std::process::exit(0);
-            }
-            other => {
-                eprintln!("Unknown argument: {other}");
-            }
-        }
-    }
-    (host, port, user, password, host_key)
-}
-
-/// Load or create a persistent Ed25519 host key. Try the requested path first,
-/// then the executable's directory. If neither can be used, keep the key only
-/// in memory for this run.
+/// Load or create one Ed25519 host key.
+///
+/// Try the requested path, then `host_key` beside the executable when that path
+/// is different. An existing file is loaded or skipped. A missing file is
+/// created or skipped. When every candidate is skipped, keep a key in memory.
 fn load_or_create_host_key(
-    explicit_path: Option<&str>,
+    requested: Option<&std::path::Path>,
 ) -> anyhow::Result<(russh::keys::PrivateKey, Option<std::path::PathBuf>)> {
-    let mut candidates = Vec::new();
-    if let Some(path) = explicit_path {
-        candidates.push(std::path::PathBuf::from(path));
-    }
-    if let Some(path) = executable_host_key_path() {
-        if !candidates.contains(&path) {
-            candidates.push(path);
-        }
-    }
-
-    for path in candidates {
-        if path.exists() {
-            match russh::keys::load_secret_key(&path, None) {
-                Ok(key) => return Ok((key, Some(displayable_path(&path)))),
-                Err(error) => log::warn!(
-                    "could not load host key '{}', trying fallback: {error}",
-                    path.display()
-                ),
-            }
-            continue;
-        }
-
-        match create_host_key_at(&path) {
-            Ok(()) => match russh::keys::load_secret_key(&path, None) {
-                Ok(key) => return Ok((key, Some(displayable_path(&path)))),
-                Err(error) => log::warn!(
-                    "could not load newly-created host key '{}': {error}",
-                    path.display()
-                ),
-            },
-            Err(error) => log::warn!(
-                "cannot persist host key at '{}', trying fallback: {error}",
-                path.display()
-            ),
+    let beside = executable_host_key_path();
+    for path in host_key_candidates(requested, beside.as_deref()) {
+        if let Some(key) = open_host_key(&path) {
+            return Ok((key, Some(displayable_path(&path))));
         }
     }
 
     log::warn!("host key is not persistent; using a new in-memory key for this run");
     let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
     Ok((key, None))
+}
+
+fn open_host_key(path: &std::path::Path) -> Option<russh::keys::PrivateKey> {
+    if path.exists() {
+        return match russh::keys::load_secret_key(path, None) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                log::warn!(
+                    "could not load host key '{}', trying fallback: {error}",
+                    path.display()
+                );
+                None
+            }
+        };
+    }
+
+    match create_host_key_at(path) {
+        Ok(()) => match russh::keys::load_secret_key(path, None) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                log::warn!(
+                    "could not load newly-created host key '{}': {error}",
+                    path.display()
+                );
+                None
+            }
+        },
+        Err(error) => {
+            log::warn!(
+                "cannot persist host key at '{}', trying fallback: {error}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn create_host_key_at(path: &std::path::Path) -> anyhow::Result<()> {
@@ -1112,11 +1161,24 @@ fn executable_host_key_path() -> Option<std::path::PathBuf> {
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let (host, port, username, password, host_key_override) = parse_args();
-
-    // Reuse or create a persistent host key, falling back to memory only when
-    // none of the default locations can be used.
-    let (host_key, host_key_path) = load_or_create_host_key(host_key_override.as_deref())?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match parse_cli(args.iter().map(String::as_str)) {
+        Ok(CliCommand::Help) => {
+            println!("{HELP}");
+            return Ok(());
+        }
+        Ok(CliCommand::Run(cli)) => cli,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    let file = match cli.config.as_deref() {
+        Some(path) => Some(ServerConfig::from_file(path)?),
+        None => None,
+    };
+    let (listen, auth) = resolve_startup(&cli, file);
+    let (host_key, host_key_path) = load_or_create_host_key(listen.host_key.as_deref())?;
     if let Some(path) = host_key_path {
         println!("SSH host key file: {}", path.display());
     } else {
@@ -1135,21 +1197,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut server = AppServer {
-        config: Arc::new(AppConfig { username, password }),
+        config: Arc::new(auth),
     };
 
-    let listener = TcpListener::bind((host.as_str(), port)).await?;
-    log::info!("SSH server listening on {host}:{port}");
-    log::info!(
-        "Login with: ssh {}@{} -p {}",
-        server.config.username,
-        if host == "0.0.0.0" {
-            "127.0.0.1"
-        } else {
-            &host
-        },
-        port
-    );
+    let listener = TcpListener::bind((listen.host.as_str(), listen.port)).await?;
+    let display_host = if listen.host == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        listen.host.as_str()
+    };
+    log::info!("SSH server listening on {}:{}", listen.host, listen.port);
+    log::info!("Login methods: {}", server.config.describe());
+    for user in server.config.password_users() {
+        log::info!(
+            "Password login: ssh {user}@{display_host} -p {}",
+            listen.port
+        );
+    }
 
     server
         .run_on_socket(Arc::new(russh_config), &listener)
@@ -1232,14 +1296,9 @@ mod tests {
     #[cfg(not(windows))]
     fn empty_path_uses_accessible_fallback_dirs() {
         let accessible = |dir: &str| matches!(dir, "/usr/bin" | "/bin" | "/system/bin");
-        let expected = "/system/bin:/usr/bin:/bin";
         assert_eq!(
             assemble_path(None, PLATFORM_PATH_DIRS, FALLBACK_PATH_DIRS, accessible),
-            expected
-        );
-        assert_eq!(
-            assemble_path(Some(""), PLATFORM_PATH_DIRS, FALLBACK_PATH_DIRS, accessible),
-            expected
+            "/system/bin:/usr/bin:/bin"
         );
     }
 }

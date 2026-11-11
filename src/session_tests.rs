@@ -12,8 +12,8 @@ use russh::ChannelMsg;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-use super::AppConfig;
 use super::AppServer;
+use super::ServerConfig;
 
 /// Capacity of the server channel queue under test. The interactive shell must
 /// discard that copy of each keystroke; otherwise the session blocks here.
@@ -56,6 +56,10 @@ fn client_config() -> Arc<russh::client::Config> {
 }
 
 async fn start_server() -> Result<Running> {
+    start_with(ServerConfig::with_password("admin", "password")).await
+}
+
+async fn start_with(auth: ServerConfig) -> Result<Running> {
     let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -69,10 +73,7 @@ async fn start_server() -> Result<Running> {
         ..Default::default()
     });
     let mut server = AppServer {
-        config: Arc::new(AppConfig {
-            username: "admin".into(),
-            password: "password".into(),
-        }),
+        config: Arc::new(auth),
     };
     let task = tokio::spawn(async move {
         use russh::server::Server as _;
@@ -670,6 +671,221 @@ async fn finish_shell_line(
 ) -> Result<(String, u32)> {
     shell.read_until(needle, timeout).await?;
     shell.wait_exit(Duration::from_secs(10)).await
+}
+
+#[tokio::test]
+async fn config_file_enables_only_the_methods_it_lists() -> Result<()> {
+    use russh::keys::ssh_key::certificate::Builder;
+    use russh::keys::PrivateKeyWithHashAlg;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "sshd-auth-session-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let cleanup = dir.clone();
+    let _guard = scopeguard_remove(cleanup);
+
+    let alice = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    let ca = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    let mut builder =
+        Builder::new_with_random_nonce(&mut rand::rng(), alice.public_key(), 0, u64::MAX)?;
+    builder.cert_type(russh::keys::ssh_key::certificate::CertType::User)?;
+    builder.key_id("alice-cert")?;
+    builder.valid_principal("alice")?;
+    let certificate = builder.sign(&ca)?;
+    let body = format!(
+        "[public_keys]\n{}\n\n[certificates]\n{}\n\n[passwords]\nbob = \"secret\"\n",
+        alice.public_key().to_openssh()?.trim(),
+        ca.public_key().to_openssh()?.trim()
+    );
+    let path = dir.join("server.conf");
+    std::fs::write(&path, body)?;
+    let server = start_with(ServerConfig::from_file(&path)?).await?;
+
+    let mut session = handshake(server.addr).await?;
+    assert!(!session
+        .authenticate_password("admin", "password")
+        .await?
+        .success());
+    assert!(!session
+        .authenticate_password("bob", "wrong")
+        .await?
+        .success());
+    assert!(session
+        .authenticate_password("bob", "secret")
+        .await?
+        .success());
+
+    let mut session = handshake(server.addr).await?;
+    let offered = PrivateKeyWithHashAlg::new(Arc::new(alice.clone()), None);
+    assert!(session
+        .authenticate_publickey("any-user", offered)
+        .await?
+        .success());
+    let mut session = handshake(server.addr).await?;
+    let stranger =
+        russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    assert!(!session
+        .authenticate_publickey(
+            "alice",
+            PrivateKeyWithHashAlg::new(Arc::new(stranger), None)
+        )
+        .await?
+        .success());
+
+    let mut session = handshake(server.addr).await?;
+    assert!(session
+        .authenticate_openssh_cert("alice", Arc::new(alice.clone()), certificate.clone())
+        .await?
+        .success());
+    let mut channel = session.channel_open_session().await?;
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await?;
+    assert!(matches!(
+        tokio::time::timeout(COMMAND_TIMEOUT, channel.wait()).await?,
+        Some(ChannelMsg::Failure)
+    ));
+    let output = exec(&session, "echo CERT_EXEC_WITHOUT_PTY").await?;
+    assert_eq!(output.code, 0, "{}", output.summary());
+    assert!(
+        output.stdout.contains("CERT_EXEC_WITHOUT_PTY"),
+        "{}",
+        output.summary()
+    );
+    channel.request_shell(true).await?;
+    assert!(matches!(
+        tokio::time::timeout(COMMAND_TIMEOUT, channel.wait()).await?,
+        Some(ChannelMsg::Failure)
+    ));
+
+    let mut session = handshake(server.addr).await?;
+    assert!(!session
+        .authenticate_openssh_cert("bob", Arc::new(alice.clone()), certificate)
+        .await?
+        .success());
+
+    let mut pty_builder =
+        Builder::new_with_random_nonce(&mut rand::rng(), alice.public_key(), 0, u64::MAX)?;
+    pty_builder
+        .cert_type(russh::keys::ssh_key::certificate::CertType::User)?
+        .key_id("alice-pty-cert")?
+        .valid_principal("alice")?
+        .extension("permit-pty", "")?;
+    let pty_certificate = pty_builder.sign(&ca)?;
+    let mut session = handshake(server.addr).await?;
+    assert!(session
+        .authenticate_openssh_cert("alice", Arc::new(alice), pty_certificate)
+        .await?
+        .success());
+    let mut channel = session.channel_open_session().await?;
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await?;
+    assert!(matches!(
+        tokio::time::timeout(COMMAND_TIMEOUT, channel.wait()).await?,
+        Some(ChannelMsg::Success)
+    ));
+    channel.close().await?;
+    let shell = Shell::open(&session, "xterm").await?;
+    shell.send_line("echo CERT_PTY_OK");
+    shell.send_line("exit");
+    let (output, status) = finish_shell_line(shell, "CERT_PTY_OK", COMMAND_TIMEOUT).await?;
+    assert!(output.contains("CERT_PTY_OK"), "{output:?}");
+    assert_eq!(status, 0, "{output}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_key_and_certificate_only_configs_reject_other_methods() -> Result<()> {
+    use russh::keys::ssh_key::certificate::{Builder, CertType};
+    use russh::keys::PrivateKeyWithHashAlg;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "sshd-auth-methods-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let _guard = scopeguard_remove(dir.clone());
+
+    let subject =
+        russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    let ca = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    let mut builder =
+        Builder::new_with_random_nonce(&mut rand::rng(), subject.public_key(), 0, u64::MAX)?;
+    builder
+        .cert_type(CertType::User)?
+        .key_id("method-isolation")?
+        .valid_principal("alice")?;
+    let certificate = builder.sign(&ca)?;
+
+    let key_config = dir.join("key-only.conf");
+    std::fs::write(
+        &key_config,
+        format!(
+            "[public_keys]\n{}\n",
+            subject.public_key().to_openssh()?.trim()
+        ),
+    )?;
+    let key_server = start_with(ServerConfig::from_file(&key_config)?).await?;
+    let mut session = handshake(key_server.addr).await?;
+    assert!(!session
+        .authenticate_password("alice", "password")
+        .await?
+        .success());
+    let mut session = handshake(key_server.addr).await?;
+    assert!(session
+        .authenticate_publickey(
+            "arbitrary-user",
+            PrivateKeyWithHashAlg::new(Arc::new(subject.clone()), None)
+        )
+        .await?
+        .success());
+
+    let ca_config = dir.join("ca-only.conf");
+    std::fs::write(
+        &ca_config,
+        format!("[certificates]\n{}\n", ca.public_key().to_openssh()?.trim()),
+    )?;
+    let ca_server = start_with(ServerConfig::from_file(&ca_config)?).await?;
+    let mut session = handshake(ca_server.addr).await?;
+    assert!(!session
+        .authenticate_password("alice", "password")
+        .await?
+        .success());
+    let mut session = handshake(ca_server.addr).await?;
+    assert!(!session
+        .authenticate_publickey(
+            "alice",
+            PrivateKeyWithHashAlg::new(Arc::new(subject.clone()), None)
+        )
+        .await?
+        .success());
+    let mut session = handshake(ca_server.addr).await?;
+    assert!(session
+        .authenticate_openssh_cert("alice", Arc::new(subject), certificate)
+        .await?
+        .success());
+    Ok(())
+}
+
+struct DirGuard(PathBuf);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scopeguard_remove(path: PathBuf) -> DirGuard {
+    DirGuard(path)
 }
 
 #[tokio::test]
