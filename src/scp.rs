@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+const OK: u8 = 0;
+const WARN: u8 = 1;
+const ERR: u8 = 2;
+
 /// Parsed `scp` command line coming from an `exec` request.
 #[derive(Debug, Clone)]
 pub struct ScpCommand {
@@ -27,7 +31,6 @@ pub struct ScpCommand {
     /// `-r` recursive.
     pub recursive: bool,
     /// `-d` target should be a directory.
-    #[allow(dead_code)]
     pub directory: bool,
     /// The path operand.
     pub path: PathBuf,
@@ -87,9 +90,13 @@ pub fn parse_scp_command(command: &str) -> Option<ScpCommand> {
     })
 }
 
-const OK: u8 = 0;
-const WARN: u8 = 1;
-const ERR: u8 = 2;
+// ---------------------------------------------------------------------------
+// Wire-level helpers
+// ---------------------------------------------------------------------------
+
+fn io_err(msg: &str) -> std::io::Error {
+    std::io::Error::other(msg.to_string())
+}
 
 /// Send a single OK (`\0`) byte.
 async fn send_ok<W: AsyncWrite + Unpin>(w: &mut W) -> std::io::Result<()> {
@@ -112,23 +119,6 @@ async fn send_error<W: AsyncWrite + Unpin>(
     w.flush().await
 }
 
-/// Read the client's status reply (`\0` = OK, otherwise an error message).
-async fn read_reply<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<()> {
-    let mut code = [0u8; 1];
-    r.read_exact(&mut code).await?;
-    match code[0] {
-        OK => Ok(()),
-        WARN | ERR => {
-            let msg = read_line(r).await?;
-            Err(std::io::Error::other(format!("scp client reported: {msg}")))
-        }
-        other => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unexpected scp reply byte: {other}"),
-        )),
-    }
-}
-
 /// Read a `\n`-terminated line (the `\n` is consumed and dropped).
 async fn read_line<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<String> {
     let mut buf = Vec::new();
@@ -146,93 +136,28 @@ async fn read_line<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Read the client's status reply (`\0` = OK, otherwise an error message).
+async fn read_reply<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<()> {
+    let mut code = [0u8; 1];
+    r.read_exact(&mut code).await?;
+    match code[0] {
+        OK => Ok(()),
+        WARN | ERR => {
+            let msg = read_line(r).await?;
+            Err(std::io::Error::other(format!("scp client reported: {msg}")))
+        }
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected scp reply byte: {other}"),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sink: client uploads to the server (`scp -t <path>` / `scp -rt <path>`).
 // ---------------------------------------------------------------------------
 
-/// Run the SCP sink protocol. `stream` is the bidirectional channel stream.
-pub async fn run_sink<S>(stream: &mut S, cmd: &ScpCommand) -> std::io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    // The target path the client gave us. Whether it is a directory or a file
-    // name is resolved per incoming entry.
-    let target = cmd.path.clone();
-
-    // Tell the client we are ready.
-    send_ok(stream).await?;
-
-    // Stack of directories we have descended into (for `D`/`E`).
-    let mut dir_stack: Vec<PathBuf> = Vec::new();
-    // Pending modification time set by a `T` line (currently parsed but unused
-    // beyond acknowledging; could be applied with filetime crate).
-    let mut _pending_time = false;
-
-    loop {
-        // Read the next control byte.
-        let mut first = [0u8; 1];
-        let n = stream.read(&mut first).await?;
-        if n == 0 {
-            break; // EOF: client finished.
-        }
-
-        match first[0] {
-            b'C' | b'D' => {
-                let line = read_line(stream).await?;
-                // line is like "0644 1234 filename"
-                let entry = match parse_cd_line(&line) {
-                    Some(e) => e,
-                    None => {
-                        send_error(stream, "bad C/D line", true).await?;
-                        return Err(io_err("malformed scp control line"));
-                    }
-                };
-
-                // Compute destination path for this entry.
-                let dest = current_dest(&target, &dir_stack, &entry.name);
-
-                if first[0] == b'D' {
-                    // Enter directory.
-                    if let Err(e) = tokio::fs::create_dir_all(&dest).await {
-                        send_error(stream, &format!("mkdir failed: {e}"), false).await?;
-                    }
-                    dir_stack.push(dest);
-                    send_ok(stream).await?;
-                } else {
-                    // Regular file: ack header, then read `size` bytes.
-                    send_ok(stream).await?;
-                    receive_file(stream, &dest, entry.size).await?;
-                    _pending_time = false;
-                }
-            }
-            b'E' => {
-                // Leave the current directory.
-                let _ = read_line(stream).await?; // consume the rest (just "\n")
-                dir_stack.pop();
-                send_ok(stream).await?;
-            }
-            b'T' => {
-                // Timestamp line: "T<mtime> 0 <atime> 0". We acknowledge it.
-                let _ = read_line(stream).await?;
-                _pending_time = true;
-                send_ok(stream).await?;
-            }
-            0 => {
-                // A stray OK from the client; ignore.
-            }
-            other => {
-                send_error(stream, &format!("unexpected scp byte: 0x{other:02x}"), true).await?;
-                return Err(io_err("unexpected scp control byte"));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 struct CdEntry {
-    #[allow(dead_code)]
-    mode: u32,
     size: u64,
     name: String,
 }
@@ -240,20 +165,26 @@ struct CdEntry {
 fn parse_cd_line(line: &str) -> Option<CdEntry> {
     // Format: "<octal-mode> <size> <name>", e.g. "0644 1234 hello.txt".
     let mut parts = line.splitn(3, ' ');
-    let mode_str = parts.next()?;
+    let _mode = parts.next()?;
     let size_str = parts.next()?;
     let name = parts.next()?.to_string();
-    let mode = u32::from_str_radix(mode_str, 8).unwrap_or(0o644);
     let size = size_str.parse::<u64>().ok()?;
-    Some(CdEntry { mode, size, name })
+    Some(CdEntry { size, name })
+}
+
+async fn target_is_existing_dir(p: &Path) -> bool {
+    tokio::fs::metadata(p)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
 }
 
 /// Decide where to write `name` given the original target and current dir stack.
-fn current_dest(target: &Path, dir_stack: &[PathBuf], name: &str) -> PathBuf {
+async fn current_dest(target: &Path, dir_stack: &[PathBuf], name: &str) -> PathBuf {
     if let Some(top) = dir_stack.last() {
         // Inside a directory we created: always join the name.
         top.join(name)
-    } else if target_is_existing_dir(target) {
+    } else if target_is_existing_dir(target).await {
         target.join(name)
     } else {
         // Target does not exist or is a file: use the target path as-is for a
@@ -262,8 +193,17 @@ fn current_dest(target: &Path, dir_stack: &[PathBuf], name: &str) -> PathBuf {
     }
 }
 
-fn target_is_existing_dir(p: &Path) -> bool {
-    std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+async fn drain<R: AsyncRead + Unpin>(r: &mut R, mut n: u64) -> std::io::Result<()> {
+    let mut buf = vec![0u8; 32 * 1024];
+    while n > 0 {
+        let want = n.min(buf.len() as u64) as usize;
+        let got = r.read(&mut buf[..want]).await?;
+        if got == 0 {
+            break;
+        }
+        n -= got as u64;
+    }
+    Ok(())
 }
 
 /// Read exactly `size` bytes of file content, then the trailing status byte,
@@ -317,16 +257,88 @@ where
     send_ok(stream).await
 }
 
-async fn drain<R: AsyncRead + Unpin>(r: &mut R, mut n: u64) -> std::io::Result<()> {
-    let mut buf = vec![0u8; 32 * 1024];
-    while n > 0 {
-        let want = n.min(buf.len() as u64) as usize;
-        let got = r.read(&mut buf[..want]).await?;
-        if got == 0 {
-            break;
-        }
-        n -= got as u64;
+/// Run the SCP sink protocol. `stream` is the bidirectional channel stream.
+pub async fn run_sink<S>(stream: &mut S, cmd: &ScpCommand) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // The target path the client gave us. Whether it is a directory or a file
+    // name is resolved per incoming entry.
+    let target = cmd.path.clone();
+
+    if cmd.directory && !target_is_existing_dir(&target).await {
+        send_error(
+            stream,
+            &format!("{}: target is not an existing directory", target.display()),
+            true,
+        )
+        .await?;
+        return Err(io_err("scp -d target is not an existing directory"));
     }
+
+    // Tell the client we are ready.
+    send_ok(stream).await?;
+
+    // Stack of directories we have descended into (for `D`/`E`).
+    let mut dir_stack: Vec<PathBuf> = Vec::new();
+
+    loop {
+        // Read the next control byte.
+        let mut first = [0u8; 1];
+        let n = stream.read(&mut first).await?;
+        if n == 0 {
+            break; // EOF: client finished.
+        }
+
+        match first[0] {
+            b'C' | b'D' => {
+                let line = read_line(stream).await?;
+                // line is like "0644 1234 filename"
+                let entry = match parse_cd_line(&line) {
+                    Some(e) => e,
+                    None => {
+                        send_error(stream, "bad C/D line", true).await?;
+                        return Err(io_err("malformed scp control line"));
+                    }
+                };
+
+                // Compute destination path for this entry.
+                let dest = current_dest(&target, &dir_stack, &entry.name).await;
+
+                if first[0] == b'D' {
+                    // Enter directory.
+                    if let Err(e) = tokio::fs::create_dir_all(&dest).await {
+                        send_error(stream, &format!("mkdir failed: {e}"), false).await?;
+                    }
+                    dir_stack.push(dest);
+                    send_ok(stream).await?;
+                } else {
+                    // Regular file: ack header, then read `size` bytes.
+                    send_ok(stream).await?;
+                    receive_file(stream, &dest, entry.size).await?;
+                }
+            }
+            b'E' => {
+                // Leave the current directory.
+                let _ = read_line(stream).await?; // consume the rest (just "\n")
+                dir_stack.pop();
+                send_ok(stream).await?;
+            }
+            b'T' => {
+                // Timestamp line: "T<mtime> 0 <atime> 0". We acknowledge it.
+                let _ = read_line(stream).await?;
+                send_ok(stream).await?;
+            }
+            0 => {
+                // A stray OK from the client; ignore.
+            }
+            other => {
+                send_error(stream, &format!("unexpected scp byte: 0x{other:02x}"), true).await?;
+                return Err(io_err("unexpected scp control byte"));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -334,43 +346,43 @@ async fn drain<R: AsyncRead + Unpin>(r: &mut R, mut n: u64) -> std::io::Result<(
 // Source: server sends files to the client (`scp -f <path>` / `scp -rf`).
 // ---------------------------------------------------------------------------
 
-/// Run the SCP source protocol, sending the requested path to the client.
-pub async fn run_source<S>(stream: &mut S, cmd: &ScpCommand) -> std::io::Result<()>
+/// Send a single regular file.
+async fn send_file<S>(stream: &mut S, path: &Path, name: &str, size: u64) -> std::io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Wait for the client's initial OK.
-    read_reply(stream).await?;
-
-    let meta = match tokio::fs::metadata(&cmd.path).await {
-        Ok(m) => m,
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
         Err(e) => {
-            send_error(stream, &format!("{}: {}", cmd.path.display(), e), false).await?;
+            send_error(stream, &format!("{}: {}", path.display(), e), false).await?;
             return Ok(());
         }
     };
 
-    if meta.is_dir() {
-        if !cmd.recursive {
-            send_error(
-                stream,
-                &format!("{}: not a regular file", cmd.path.display()),
-                false,
-            )
-            .await?;
-            return Ok(());
-        }
-        send_dir(stream, &cmd.path).await?;
-    } else {
-        let name = cmd
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file")
-            .to_string();
-        send_file(stream, &cmd.path, &name, meta.len()).await?;
-    }
+    // C<mode> <size> <name>
+    let header = format!("C0644 {size} {name}\n");
+    stream.write_all(header.as_bytes()).await?;
+    stream.flush().await?;
+    read_reply(stream).await?;
 
+    // File body.
+    let mut remaining = size;
+    let mut buf = vec![0u8; 32 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..want]).await?;
+        if n == 0 {
+            break;
+        }
+        stream.write_all(&buf[..n]).await?;
+        remaining -= n as u64;
+    }
+    stream.flush().await?;
+
+    // Trailing OK byte to signal end of file body.
+    send_ok(stream).await?;
+    // Read the client's acknowledgement.
+    read_reply(stream).await?;
     Ok(())
 }
 
@@ -415,46 +427,42 @@ where
     })
 }
 
-/// Send a single regular file.
-async fn send_file<S>(stream: &mut S, path: &Path, name: &str, size: u64) -> std::io::Result<()>
+/// Run the SCP source protocol, sending the requested path to the client.
+pub async fn run_source<S>(stream: &mut S, cmd: &ScpCommand) -> std::io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
+    // Wait for the client's initial OK.
+    read_reply(stream).await?;
+
+    let meta = match tokio::fs::metadata(&cmd.path).await {
+        Ok(m) => m,
         Err(e) => {
-            send_error(stream, &format!("{}: {}", path.display(), e), false).await?;
+            send_error(stream, &format!("{}: {}", cmd.path.display(), e), false).await?;
             return Ok(());
         }
     };
 
-    // C<mode> <size> <name>
-    let header = format!("C0644 {size} {name}\n");
-    stream.write_all(header.as_bytes()).await?;
-    stream.flush().await?;
-    read_reply(stream).await?;
-
-    // File body.
-    let mut remaining = size;
-    let mut buf = vec![0u8; 32 * 1024];
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        let n = file.read(&mut buf[..want]).await?;
-        if n == 0 {
-            break;
+    if meta.is_dir() {
+        if !cmd.recursive {
+            send_error(
+                stream,
+                &format!("{}: not a regular file", cmd.path.display()),
+                false,
+            )
+            .await?;
+            return Ok(());
         }
-        stream.write_all(&buf[..n]).await?;
-        remaining -= n as u64;
+        send_dir(stream, &cmd.path).await?;
+    } else {
+        let name = cmd
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        send_file(stream, &cmd.path, &name, meta.len()).await?;
     }
-    stream.flush().await?;
 
-    // Trailing OK byte to signal end of file body.
-    send_ok(stream).await?;
-    // Read the client's acknowledgement.
-    read_reply(stream).await?;
     Ok(())
-}
-
-fn io_err(msg: &str) -> std::io::Error {
-    std::io::Error::other(msg.to_string())
 }

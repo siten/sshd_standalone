@@ -6,8 +6,8 @@
 //! plain `scp` and `sftp` work against this server.
 //!
 //! It maps SFTP operations onto the local filesystem (relative to the process
-//! working directory). Handles are random opaque strings; per-handle state
-//! (open files and directory iterators) is kept in maps.
+//! working directory). Handles are opaque strings; per-handle state
+//! (open files and directory streams) is kept in maps.
 
 use std::collections::HashMap;
 use std::io;
@@ -19,20 +19,14 @@ use std::task::{Context, Poll};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-/// Run SFTP while converting a closed SSH channel into EOF for russh-sftp.
-///
-/// russh-sftp 3.0 retries every stream error other than `UnexpectedEof`. A
-/// reset SSH connection therefore makes its detached server task spin forever
-/// and repeatedly log the same error. Treating stream errors as EOF lets that
-/// task terminate and drop the channel cleanly.
-pub async fn run<S>(stream: S, session: SftpSession)
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    russh_sftp::server::run(DisconnectAsEof(stream), session).await;
-}
+const MAX_READ_LEN: usize = 256 * 1024;
+const READDIR_BATCH_SIZE: usize = 128;
+
+// ---------------------------------------------------------------------------
+// Stream adapter and status helpers
+// ---------------------------------------------------------------------------
 
 struct DisconnectAsEof<S>(S);
 
@@ -88,17 +82,60 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for DisconnectAsEof<S> {
     }
 }
 
-/// One open regular file, tracked by its handle id.
-struct OpenFile {
-    file: std::fs::File,
+/// Map a std::io::Error to the closest SFTP status code.
+fn io_to_status(e: &std::io::Error) -> StatusCode {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        NotFound => StatusCode::NoSuchFile,
+        PermissionDenied => StatusCode::PermissionDenied,
+        _ => StatusCode::Failure,
+    }
 }
 
-/// One opened directory: the precomputed entries and whether we've already
-/// returned them (SFTP `readdir` is called repeatedly until EOF).
+/// Build a successful `Status` reply.
+fn ok_status(id: u32) -> Status {
+    Status {
+        id,
+        status_code: StatusCode::Ok,
+        error_message: "Ok".to_string(),
+        language_tag: "en-US".to_string(),
+    }
+}
+
+/// Convert an `std::fs::Metadata` into SFTP `FileAttributes`.
+fn meta_to_attrs(meta: &std::fs::Metadata) -> FileAttributes {
+    FileAttributes::from(meta)
+}
+
+/// Render a path as a forward-slash string. On Windows, canonicalize() yields
+/// a `\\?\C:\...` extended-length path; strip the prefix and normalize slashes
+/// so SFTP clients see a clean path.
+fn path_to_string(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    let s = s.replace('\\', "/");
+    if s.is_empty() {
+        "/".to_string()
+    } else {
+        s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SFTP session state and Handler implementation
+// ---------------------------------------------------------------------------
+
+/// One open regular file, tracked by its handle id.
+struct OpenFile {
+    file: tokio::fs::File,
+}
+
+/// One opened directory stream, yielded in bounded batches by `readdir`.
 struct OpenDir {
     path: PathBuf,
-    entries: Vec<File>,
-    done: bool,
+    reader: tokio::fs::ReadDir,
+    pending_dots: Vec<File>,
+    exhausted: bool,
 }
 
 /// The per-connection SFTP session handler.
@@ -128,31 +165,6 @@ impl SftpSession {
         let n = self.next_handle.fetch_add(1, Ordering::Relaxed);
         format!("{kind}-{n}")
     }
-}
-
-/// Map a std::io::Error to the closest SFTP status code.
-fn io_to_status(e: &std::io::Error) -> StatusCode {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        NotFound => StatusCode::NoSuchFile,
-        PermissionDenied => StatusCode::PermissionDenied,
-        _ => StatusCode::Failure,
-    }
-}
-
-/// Build a successful `Status` reply.
-fn ok_status(id: u32) -> Status {
-    Status {
-        id,
-        status_code: StatusCode::Ok,
-        error_message: "Ok".to_string(),
-        language_tag: "en-US".to_string(),
-    }
-}
-
-/// Convert an `std::fs::Metadata` into SFTP `FileAttributes`.
-fn meta_to_attrs(meta: &std::fs::Metadata) -> FileAttributes {
-    FileAttributes::from(meta)
 }
 
 #[allow(unused_variables)]
@@ -186,15 +198,18 @@ impl russh_sftp::server::Handler for SftpSession {
         } else {
             path
         };
-        let resolved = std::fs::canonicalize(&p).unwrap_or_else(|_| {
-            // If it doesn't exist yet, fall back to an absolute (lexical) path.
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-            if Path::new(&p).is_absolute() {
-                PathBuf::from(&p)
-            } else {
-                cwd.join(&p)
+        let resolved = match tokio::fs::canonicalize(&p).await {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                // If it doesn't exist yet, fall back to an absolute (lexical) path.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+                if Path::new(&p).is_absolute() {
+                    PathBuf::from(&p)
+                } else {
+                    cwd.join(&p)
+                }
             }
-        });
+        };
         let name = path_to_string(&resolved);
         log::info!("sftp realpath: {p} -> {name}");
         Ok(Name {
@@ -204,7 +219,9 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let meta = std::fs::metadata(&path).map_err(|e| io_to_status(&e))?;
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| io_to_status(&e))?;
         Ok(Attrs {
             id,
             attrs: meta_to_attrs(&meta),
@@ -212,7 +229,9 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| io_to_status(&e))?;
+        let meta = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|e| io_to_status(&e))?;
         Ok(Attrs {
             id,
             attrs: meta_to_attrs(&meta),
@@ -221,7 +240,7 @@ impl russh_sftp::server::Handler for SftpSession {
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
         let of = self.files.get(&handle).ok_or(StatusCode::Failure)?;
-        let meta = of.file.metadata().map_err(|e| io_to_status(&e))?;
+        let meta = of.file.metadata().await.map_err(|e| io_to_status(&e))?;
         Ok(Attrs {
             id,
             attrs: meta_to_attrs(&meta),
@@ -236,12 +255,15 @@ impl russh_sftp::server::Handler for SftpSession {
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
         // Translate SFTP open flags into std OpenOptions (the crate provides a
-        // direct conversion).
-        let opts: std::fs::OpenOptions = pflags.into();
-        let file = opts.open(&filename).map_err(|e| {
-            log::warn!("sftp open {filename} failed: {e}");
-            io_to_status(&e)
-        })?;
+        // direct conversion), then open asynchronously with Tokio.
+        let std_opts: std::fs::OpenOptions = pflags.into();
+        let file = tokio::fs::OpenOptions::from(std_opts)
+            .open(&filename)
+            .await
+            .map_err(|e| {
+                log::warn!("sftp open {filename} failed: {e}");
+                io_to_status(&e)
+            })?;
         let handle = self.new_handle("file");
         self.files.insert(handle.clone(), OpenFile { file });
         log::info!("sftp open: {filename} (flags {pflags:?}) -> {handle}");
@@ -255,13 +277,13 @@ impl russh_sftp::server::Handler for SftpSession {
         offset: u64,
         len: u32,
     ) -> Result<Data, Self::Error> {
-        use std::io::{Read, Seek, SeekFrom};
         let of = self.files.get_mut(&handle).ok_or(StatusCode::Failure)?;
         of.file
-            .seek(SeekFrom::Start(offset))
+            .seek(io::SeekFrom::Start(offset))
+            .await
             .map_err(|e| io_to_status(&e))?;
-        let mut buf = vec![0u8; len as usize];
-        let n = of.file.read(&mut buf).map_err(|e| io_to_status(&e))?;
+        let mut buf = vec![0u8; (len as usize).min(MAX_READ_LEN)];
+        let n = of.file.read(&mut buf).await.map_err(|e| io_to_status(&e))?;
         if n == 0 {
             // End of file: SFTP signals this with an EOF status.
             return Err(StatusCode::Eof);
@@ -277,58 +299,45 @@ impl russh_sftp::server::Handler for SftpSession {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
-        use std::io::{Seek, SeekFrom, Write};
         let of = self.files.get_mut(&handle).ok_or(StatusCode::Failure)?;
         of.file
-            .seek(SeekFrom::Start(offset))
+            .seek(io::SeekFrom::Start(offset))
+            .await
             .map_err(|e| io_to_status(&e))?;
-        of.file.write_all(&data).map_err(|e| io_to_status(&e))?;
+        of.file
+            .write_all(&data)
+            .await
+            .map_err(|e| io_to_status(&e))?;
         Ok(ok_status(id))
     }
 
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
         // Dropping the entry closes the underlying file/dir.
-        let was_file = self.files.remove(&handle).is_some();
-        let was_dir = self.dirs.remove(&handle).is_some();
-        if was_file || was_dir {
-            Ok(ok_status(id))
-        } else {
-            // Unknown handle: still respond OK to keep the client happy.
-            Ok(ok_status(id))
-        }
+        // Unknown handles are treated as closed as well, keeping close idempotent.
+        self.files.remove(&handle);
+        self.dirs.remove(&handle);
+        Ok(ok_status(id))
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
-        let meta = std::fs::metadata(&path).map_err(|e| io_to_status(&e))?;
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| io_to_status(&e))?;
         if !meta.is_dir() {
             return Err(StatusCode::NoSuchFile);
         }
 
-        // Precompute the directory listing now, including "." and "..".
-        let mut files = Vec::new();
         let dir_path = PathBuf::from(&path);
+        let reader = tokio::fs::read_dir(&dir_path)
+            .await
+            .map_err(|e| io_to_status(&e))?;
 
-        if let Ok(m) = std::fs::metadata(&dir_path) {
-            files.push(File::new(".", meta_to_attrs(&m)));
-        }
+        let mut pending_dots = Vec::new();
+        pending_dots.push(File::new(".", meta_to_attrs(&meta)));
         if let Some(parent) = dir_path.parent() {
-            if let Ok(m) = std::fs::metadata(parent) {
-                files.push(File::new("..", meta_to_attrs(&m)));
+            if let Ok(m) = tokio::fs::metadata(parent).await {
+                pending_dots.push(File::new("..", meta_to_attrs(&m)));
             }
-        }
-
-        match std::fs::read_dir(&dir_path) {
-            Ok(rd) => {
-                for entry in rd.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let attrs = match entry.metadata() {
-                        Ok(m) => meta_to_attrs(&m),
-                        Err(_) => FileAttributes::default(),
-                    };
-                    files.push(File::new(name, attrs));
-                }
-            }
-            Err(e) => return Err(io_to_status(&e)),
         }
 
         let handle = self.new_handle("dir");
@@ -336,8 +345,9 @@ impl russh_sftp::server::Handler for SftpSession {
             handle.clone(),
             OpenDir {
                 path: dir_path,
-                entries: files,
-                done: false,
+                reader,
+                pending_dots,
+                exhausted: false,
             },
         );
         log::info!("sftp opendir: {path} -> {handle}");
@@ -346,12 +356,36 @@ impl russh_sftp::server::Handler for SftpSession {
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
         let dir = self.dirs.get_mut(&handle).ok_or(StatusCode::Failure)?;
-        if dir.done {
-            // All entries already returned: signal EOF.
+        if dir.exhausted && dir.pending_dots.is_empty() {
             return Err(StatusCode::Eof);
         }
-        dir.done = true;
-        let files = std::mem::take(&mut dir.entries);
+
+        let mut files = Vec::new();
+        while !dir.pending_dots.is_empty() && files.len() < READDIR_BATCH_SIZE {
+            files.push(dir.pending_dots.remove(0));
+        }
+
+        while !dir.exhausted && files.len() < READDIR_BATCH_SIZE {
+            match dir.reader.next_entry().await {
+                Ok(Some(entry)) => {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let attrs = match entry.metadata().await {
+                        Ok(m) => meta_to_attrs(&m),
+                        Err(_) => FileAttributes::default(),
+                    };
+                    files.push(File::new(name, attrs));
+                }
+                Ok(None) => {
+                    dir.exhausted = true;
+                }
+                Err(e) => return Err(io_to_status(&e)),
+            }
+        }
+
+        if files.is_empty() {
+            return Err(StatusCode::Eof);
+        }
+
         log::info!(
             "sftp readdir: {} -> {} entries",
             path_to_string(&dir.path),
@@ -361,7 +395,9 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
-        std::fs::remove_file(&filename).map_err(|e| io_to_status(&e))?;
+        tokio::fs::remove_file(&filename)
+            .await
+            .map_err(|e| io_to_status(&e))?;
         Ok(ok_status(id))
     }
 
@@ -371,12 +407,16 @@ impl russh_sftp::server::Handler for SftpSession {
         path: String,
         _attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        std::fs::create_dir_all(&path).map_err(|e| io_to_status(&e))?;
+        tokio::fs::create_dir_all(&path)
+            .await
+            .map_err(|e| io_to_status(&e))?;
         Ok(ok_status(id))
     }
 
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
-        std::fs::remove_dir(&path).map_err(|e| io_to_status(&e))?;
+        tokio::fs::remove_dir(&path)
+            .await
+            .map_err(|e| io_to_status(&e))?;
         Ok(ok_status(id))
     }
 
@@ -386,7 +426,9 @@ impl russh_sftp::server::Handler for SftpSession {
         oldpath: String,
         newpath: String,
     ) -> Result<Status, Self::Error> {
-        std::fs::rename(&oldpath, &newpath).map_err(|e| io_to_status(&e))?;
+        tokio::fs::rename(&oldpath, &newpath)
+            .await
+            .map_err(|e| io_to_status(&e))?;
         Ok(ok_status(id))
     }
 
@@ -411,18 +453,17 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 }
 
-/// Render a path as a forward-slash string. On Windows, canonicalize() yields
-/// a `\\?\C:\...` extended-length path; strip the prefix and normalize slashes
-/// so SFTP clients see a clean path.
-fn path_to_string(p: &Path) -> String {
-    let s = p.to_string_lossy();
-    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-    let s = s.replace('\\', "/");
-    if s.is_empty() {
-        "/".to_string()
-    } else {
-        s
-    }
+/// Run SFTP while converting a closed SSH channel into EOF for russh-sftp.
+///
+/// russh-sftp 3.0 retries every stream error other than `UnexpectedEof`. A
+/// reset SSH connection therefore makes its detached server task spin forever
+/// and repeatedly log the same error. Treating stream errors as EOF lets that
+/// task terminate and drop the channel cleanly.
+pub async fn run<S>(stream: S, session: SftpSession)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    russh_sftp::server::run(DisconnectAsEof(stream), session).await;
 }
 
 #[cfg(test)]
@@ -436,98 +477,31 @@ mod tests {
 
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-    /// Every failed read, write, flush, and shutdown becomes UnexpectedEof.
-    /// russh-sftp exits its server loop only for that error.
-    #[tokio::test]
-    async fn disconnect_as_eof_rewrites_io_errors() {
-        for kind in [
-            io::ErrorKind::ConnectionReset,
-            io::ErrorKind::BrokenPipe,
-            io::ErrorKind::UnexpectedEof,
-        ] {
-            assert_rewritten(kind).await;
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> io::Result<Self> {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+            loop {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("sshd-sftp-readdir-{}-{id}", std::process::id()));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Ok(Self(path)),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
         }
     }
 
-    async fn assert_rewritten(kind: io::ErrorKind) {
-        let mut stream = super::DisconnectAsEof(FailIo { kind });
-        assert_closed(stream.read(&mut [0u8; 4]).await.expect_err("read"));
-
-        let mut stream = super::DisconnectAsEof(FailIo { kind });
-        assert_closed(stream.write(&[1, 2, 3]).await.expect_err("write"));
-
-        let mut stream = super::DisconnectAsEof(FailIo { kind });
-        assert_closed(stream.flush().await.expect_err("flush"));
-
-        let mut stream = super::DisconnectAsEof(FailIo { kind });
-        assert_closed(stream.shutdown().await.expect_err("shutdown"));
-    }
-
-    fn assert_closed(error: io::Error) {
-        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(error.to_string(), "SFTP SSH channel closed");
-    }
-
-    /// Successful IO, including a zero-byte read, is passed through unchanged.
-    #[tokio::test]
-    async fn disconnect_as_eof_passes_successful_io() {
-        let mut stream = super::DisconnectAsEof(OkIo {
-            chunk: b"ok",
-            read: false,
-        });
-        let mut buf = [0u8; 4];
-        let n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ok");
-        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
-        assert_eq!(stream.write(b"abc").await.unwrap(), 3);
-        stream.flush().await.unwrap();
-        stream.shutdown().await.unwrap();
-    }
-
-    /// russh-sftp retries every stream error other than UnexpectedEof on a
-    /// detached task. A reset that stays a reset never returns to this sleep.
-    /// The occasional Pending only lets a broken loop be stopped and counted.
-    #[test]
-    fn sftp_reset_does_not_spin() {
-        let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let stop_task = Arc::clone(&stop);
-
-        let worker = std::thread::Builder::new()
-            .name("sftp-reset".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                    .expect("runtime");
-                let reads = Arc::new(AtomicUsize::new(0));
-                runtime.block_on(async move {
-                    let reads_for_send = Arc::clone(&reads);
-                    super::run(
-                        ResetStream {
-                            reads,
-                            stop: stop_task,
-                        },
-                        super::SftpSession::default(),
-                    )
-                    .await;
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    let _ = tx.send(reads_for_send.load(Ordering::Relaxed));
-                });
-            })
-            .expect("spawn sftp reset thread");
-
-        let result = rx.recv_timeout(Duration::from_secs(2));
-        stop.store(true, Ordering::Relaxed);
-        if let Err(panic) = worker.join() {
-            std::panic::resume_unwind(panic);
-        }
-        match result {
-            Ok(reads) => assert!(
-                (1..=8).contains(&reads),
-                "a reset should end the sftp task on the first read, saw {reads} reads"
-            ),
-            Err(error) => panic!("sftp task kept running after connection reset: {error}"),
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -643,6 +617,144 @@ mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    fn assert_closed(error: io::Error) {
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "SFTP SSH channel closed");
+    }
+
+    async fn assert_rewritten(kind: io::ErrorKind) {
+        let mut stream = super::DisconnectAsEof(FailIo { kind });
+        assert_closed(stream.read(&mut [0u8; 4]).await.expect_err("read"));
+
+        let mut stream = super::DisconnectAsEof(FailIo { kind });
+        assert_closed(stream.write(&[1, 2, 3]).await.expect_err("write"));
+
+        let mut stream = super::DisconnectAsEof(FailIo { kind });
+        assert_closed(stream.flush().await.expect_err("flush"));
+
+        let mut stream = super::DisconnectAsEof(FailIo { kind });
+        assert_closed(stream.shutdown().await.expect_err("shutdown"));
+    }
+
+    /// Every failed read, write, flush, and shutdown becomes UnexpectedEof.
+    /// russh-sftp exits its server loop only for that error.
+    #[tokio::test]
+    async fn disconnect_as_eof_rewrites_io_errors() {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_rewritten(kind).await;
+        }
+    }
+
+    /// Successful IO, including a zero-byte read, is passed through unchanged.
+    #[tokio::test]
+    async fn disconnect_as_eof_passes_successful_io() {
+        let mut stream = super::DisconnectAsEof(OkIo {
+            chunk: b"ok",
+            read: false,
+        });
+        let mut buf = [0u8; 4];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ok");
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(stream.write(b"abc").await.unwrap(), 3);
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    /// russh-sftp retries every stream error other than UnexpectedEof on a
+    /// detached task. A reset that stays a reset never returns to this sleep.
+    /// The occasional Pending only lets a broken loop be stopped and counted.
+    #[test]
+    fn sftp_reset_does_not_spin() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop_task = Arc::clone(&stop);
+
+        let worker = std::thread::Builder::new()
+            .name("sftp-reset".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("runtime");
+                let reads = Arc::new(AtomicUsize::new(0));
+                runtime.block_on(async move {
+                    let reads_for_send = Arc::clone(&reads);
+                    super::run(
+                        ResetStream {
+                            reads,
+                            stop: stop_task,
+                        },
+                        super::SftpSession::default(),
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let _ = tx.send(reads_for_send.load(Ordering::Relaxed));
+                });
+            })
+            .expect("spawn sftp reset thread");
+
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        stop.store(true, Ordering::Relaxed);
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+        match result {
+            Ok(reads) => assert!(
+                (1..=8).contains(&reads),
+                "a reset should end the sftp task on the first read, saw {reads} reads"
+            ),
+            Err(error) => panic!("sftp task kept running after connection reset: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn readdir_streams_entries_in_batches() {
+        use russh_sftp::protocol::StatusCode;
+        use russh_sftp::server::Handler as _;
+
+        let dir = TempDir::new().expect("create unique SFTP test directory");
+
+        let total_files = super::READDIR_BATCH_SIZE + 5;
+        for i in 0..total_files {
+            std::fs::write(dir.path().join(format!("file-{i:03}.txt")), b"x").unwrap();
+        }
+
+        let mut session = super::SftpSession::default();
+        let handle = session
+            .opendir(1, dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap()
+            .handle;
+
+        let mut seen = Vec::new();
+        let mut batches = 0;
+        loop {
+            match session.readdir(2, handle.clone()).await {
+                Ok(name) => {
+                    batches += 1;
+                    assert!(name.files.len() <= super::READDIR_BATCH_SIZE);
+                    seen.extend(name.files.into_iter().map(|f| f.filename));
+                }
+                Err(StatusCode::Eof) => break,
+                Err(other) => panic!("unexpected readdir error: {other:?}"),
+            }
+        }
+
+        session.close(3, handle).await.unwrap();
+
+        assert!(batches >= 2, "expected multiple batches, got {batches}");
+        assert!(seen.contains(&".".to_string()));
+        assert!(seen.contains(&"..".to_string()));
+        for i in 0..total_files {
+            assert!(seen.contains(&format!("file-{i:03}.txt")));
         }
     }
 }

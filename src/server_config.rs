@@ -13,6 +13,11 @@ use russh::keys::{Certificate, HashAlg, PublicKey};
 use russh::{MethodKind, MethodSet};
 use subtle::ConstantTimeEq;
 
+pub const DEFAULT_LISTEN_HOST: &str = "0.0.0.0";
+pub const DEFAULT_LISTEN_PORT: u16 = 2222;
+pub const DEFAULT_USER: &str = "admin";
+pub const DEFAULT_PASSWORD: &str = "admpass";
+
 struct PasswordLogin {
     user: String,
     password: String,
@@ -35,137 +40,138 @@ enum Section {
     Passwords,
 }
 
-impl ServerConfig {
-    pub fn with_password(user: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            passwords: vec![PasswordLogin {
-                user: user.into(),
-                password: password.into(),
-            }],
-            public_keys: Vec::new(),
-            ca_fingerprints: Vec::new(),
-            host: None,
-            port: None,
-            host_key: None,
+// ---------------------------------------------------------------------------
+// Config file parser (bottom-up: value/line helpers -> section/file parser)
+// ---------------------------------------------------------------------------
+
+fn resolve_path(base: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn parse_value(raw: &str) -> Result<String> {
+    let starts_quoted = raw.starts_with('"');
+    let ends_quoted = raw.ends_with('"');
+    match (starts_quoted, ends_quoted) {
+        (true, true) if raw.len() >= 2 => {
+            let mut value = String::new();
+            let mut chars = raw[1..raw.len() - 1].chars();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '"' => bail!("unescaped quote"),
+                    '\\' => match chars.next() {
+                        Some('"') => value.push('"'),
+                        Some('\\') => value.push('\\'),
+                        Some(next) => {
+                            value.push('\\');
+                            value.push(next);
+                        }
+                        None => bail!("trailing escape"),
+                    },
+                    _ => value.push(ch),
+                }
+            }
+            Ok(value)
         }
+        (true, _) | (_, true) => bail!("unmatched quote"),
+        _ if raw.contains('"') => bail!("unmatched quote"),
+        _ => Ok(raw.to_string()),
     }
+}
 
-    #[cfg(test)]
-    pub fn host(&self) -> Option<&str> {
-        self.host.as_deref()
-    }
-
-    #[cfg(test)]
-    pub fn port(&self) -> Option<u16> {
-        self.port
-    }
-
-    #[cfg(test)]
-    pub fn host_key(&self) -> Option<&Path> {
-        self.host_key.as_deref()
-    }
-
-    /// Load `path`. A method is enabled only by a valid entry of that kind.
-    pub fn from_file(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read server config '{}'", path.display()))?;
-        let config = parse_config(&text, path)?;
-        if !config.any_method() {
-            bail!("server config '{}' enables no login method", path.display());
-        }
-        Ok(config)
-    }
-
-    pub fn allows_password(&self) -> bool {
-        !self.passwords.is_empty()
-    }
-
-    pub fn allows_public_key(&self) -> bool {
-        !self.public_keys.is_empty()
-    }
-
-    pub fn allows_certificate(&self) -> bool {
-        !self.ca_fingerprints.is_empty()
-    }
-
-    /// `publickey` covers both raw keys and OpenSSH user certificates.
-    pub fn method_set(&self) -> MethodSet {
-        let mut methods = Vec::new();
-        if self.allows_password() {
-            methods.push(MethodKind::Password);
-        }
-        if self.allows_public_key() || self.allows_certificate() {
-            methods.push(MethodKind::PublicKey);
-        }
-        MethodSet::from(methods.as_slice())
-    }
-
-    pub fn password_users(&self) -> impl Iterator<Item = &str> {
-        self.passwords.iter().map(|login| login.user.as_str())
-    }
-
-    pub fn describe(&self) -> String {
-        let mut parts = Vec::new();
-        if self.allows_password() {
-            let users: Vec<_> = self.password_users().collect();
-            parts.push(format!("password ({})", users.join(", ")));
-        }
-        if self.allows_public_key() {
-            parts.push(format!("public key ({} keys)", self.public_keys.len()));
-        }
-        if self.allows_certificate() {
-            parts.push(format!("certificate ({} CAs)", self.ca_fingerprints.len()));
-        }
-        parts.join(", ")
-    }
-
-    pub fn accepts_password(&self, user: &str, password: &str) -> bool {
-        self.passwords.iter().any(|login| {
-            login.user == user && bool::from(login.password.as_bytes().ct_eq(password.as_bytes()))
-        })
-    }
-
-    pub fn accepts_public_key(&self, key: &PublicKey) -> bool {
-        self.public_keys
-            .iter()
-            .any(|allowed| allowed.key_data() == key.key_data())
-    }
-
-    /// `None` means the certificate may log in as `user`.
-    pub fn reject_certificate_reason(
-        &self,
-        user: &str,
-        certificate: &Certificate,
-    ) -> Option<&'static str> {
-        if !certificate.cert_type().is_user() {
-            return Some("not a user certificate");
-        }
-        if !certificate.critical_options().is_empty() {
-            return Some("critical options are not supported");
-        }
-        let principals = certificate.valid_principals();
-        if principals.is_empty() || !principals.iter().any(|principal| principal == user) {
-            return Some("principal does not match the user");
-        }
-        if certificate.validate(self.ca_fingerprints.iter()).is_err() {
-            return Some("CA is not trusted or the certificate is outside its validity window");
-        }
+fn section_name(line: &str) -> Option<&str> {
+    let line = line.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if line.is_empty() {
         None
+    } else {
+        Some(line)
     }
+}
 
-    /// OpenSSH certificate extensions grant capabilities. This server's shell
-    /// implementation always allocates a PTY, so only certificates explicitly
-    /// carrying the empty `permit-pty` extension may request a shell.
-    pub fn certificate_allows_pty(&self, certificate: &Certificate) -> bool {
-        certificate
-            .extensions()
-            .get("permit-pty")
-            .is_some_and(String::is_empty)
+fn parse_password(line: &str) -> Result<(String, String)> {
+    let Some((user, raw)) = line.split_once('=') else {
+        bail!("password line must be user = \"password\"");
+    };
+    let user = user.trim();
+    if user.is_empty() {
+        bail!("password line is missing a user");
     }
+    let password = parse_value(raw.trim())?;
+    if password.is_empty() {
+        bail!("password is empty");
+    }
+    Ok((user.to_string(), password))
+}
 
-    fn any_method(&self) -> bool {
-        self.allows_password() || self.allows_public_key() || self.allows_certificate()
+fn apply_listen_setting(
+    config: &mut ServerConfig,
+    base: &Path,
+    path: &Path,
+    line_number: usize,
+    line: &str,
+) -> Result<()> {
+    let Some((key, raw)) = line.split_once('=') else {
+        bail!(
+            "{}:{line_number}: line is outside a section",
+            path.display()
+        );
+    };
+    let key = key.trim();
+    if !matches!(key, "host" | "port" | "host-key") {
+        bail!(
+            "{}:{line_number}: line is outside a section",
+            path.display()
+        );
     }
+    let value = parse_value(raw.trim()).with_context(|| {
+        format!(
+            "{}:{line_number}: invalid quoted value for {key}",
+            path.display()
+        )
+    })?;
+    if value.is_empty() {
+        bail!("{}:{line_number}: {key} is empty", path.display());
+    }
+    match key {
+        "host" => {
+            if let Some(previous) = &config.host {
+                bail!(
+                    "{}:{line_number}: duplicate host \"{previous}\" and \"{value}\"",
+                    path.display()
+                );
+            }
+            config.host = Some(value);
+        }
+        "port" => {
+            if let Some(previous) = config.port {
+                bail!(
+                    "{}:{line_number}: duplicate port {previous} and \"{value}\"",
+                    path.display()
+                );
+            }
+            config.port = Some(
+                value
+                    .parse::<u16>()
+                    .with_context(|| format!("{}:{line_number}: invalid port", path.display()))?,
+            );
+        }
+        "host-key" => {
+            if let Some(previous) = &config.host_key {
+                bail!(
+                    "{}:{line_number}: duplicate host-key \"{}\" and \"{value}\"",
+                    path.display(),
+                    previous.display()
+                );
+            }
+            config.host_key = Some(resolve_path(base, &value));
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
 fn parse_config(text: &str, path: &Path) -> Result<ServerConfig> {
@@ -242,120 +248,142 @@ fn parse_config(text: &str, path: &Path) -> Result<ServerConfig> {
     Ok(config)
 }
 
-fn apply_listen_setting(
-    config: &mut ServerConfig,
-    base: &Path,
-    path: &Path,
-    line_number: usize,
-    line: &str,
-) -> Result<()> {
-    let Some((key, raw)) = line.split_once('=') else {
-        bail!(
-            "{}:{line_number}: line is outside a section",
-            path.display()
-        );
-    };
-    let key = key.trim();
-    if !matches!(key, "host" | "port" | "host-key") {
-        bail!(
-            "{}:{line_number}: line is outside a section",
-            path.display()
-        );
-    }
-    let value = parse_value(raw.trim()).with_context(|| {
-        format!(
-            "{}:{line_number}: invalid quoted value for {key}",
-            path.display()
-        )
-    })?;
-    if value.is_empty() {
-        bail!("{}:{line_number}: {key} is empty", path.display());
-    }
-    match key {
-        "host" => {
-            if let Some(previous) = &config.host {
-                bail!(
-                    "{}:{line_number}: duplicate host \"{previous}\" and \"{value}\"",
-                    path.display()
-                );
-            }
-            config.host = Some(value);
+impl ServerConfig {
+    pub fn with_password(user: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            passwords: vec![PasswordLogin {
+                user: user.into(),
+                password: password.into(),
+            }],
+            public_keys: Vec::new(),
+            ca_fingerprints: Vec::new(),
+            host: None,
+            port: None,
+            host_key: None,
         }
-        "port" => {
-            if let Some(previous) = config.port {
-                bail!(
-                    "{}:{line_number}: duplicate port {previous} and \"{value}\"",
-                    path.display()
-                );
-            }
-            config.port = Some(
-                value
-                    .parse::<u16>()
-                    .with_context(|| format!("{}:{line_number}: invalid port", path.display()))?,
-            );
-        }
-        "host-key" => {
-            if let Some(previous) = &config.host_key {
-                bail!(
-                    "{}:{line_number}: duplicate host-key \"{}\" and \"{value}\"",
-                    path.display(),
-                    previous.display()
-                );
-            }
-            config.host_key = Some(resolve_path(base, &value));
-        }
-        _ => unreachable!(),
     }
-    Ok(())
-}
 
-fn resolve_path(base: &Path, path: &str) -> std::path::PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
+    #[cfg(test)]
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
     }
-}
 
-fn parse_value(raw: &str) -> Result<String> {
-    let starts_quoted = raw.starts_with('"');
-    let ends_quoted = raw.ends_with('"');
-    match (starts_quoted, ends_quoted) {
-        (true, true) if raw.len() >= 2 => {
-            let mut value = String::new();
-            let mut chars = raw[1..raw.len() - 1].chars();
-            while let Some(ch) = chars.next() {
-                match ch {
-                    '"' => bail!("unescaped quote"),
-                    '\\' => match chars.next() {
-                        Some('"') => value.push('"'),
-                        Some('\\') => value.push('\\'),
-                        Some(next) => {
-                            value.push('\\');
-                            value.push(next);
-                        }
-                        None => bail!("trailing escape"),
-                    },
-                    _ => value.push(ch),
-                }
-            }
-            Ok(value)
+    #[cfg(test)]
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    #[cfg(test)]
+    pub fn host_key(&self) -> Option<&Path> {
+        self.host_key.as_deref()
+    }
+
+    pub fn allows_password(&self) -> bool {
+        !self.passwords.is_empty()
+    }
+
+    pub fn allows_public_key(&self) -> bool {
+        !self.public_keys.is_empty()
+    }
+
+    pub fn allows_certificate(&self) -> bool {
+        !self.ca_fingerprints.is_empty()
+    }
+
+    fn any_method(&self) -> bool {
+        self.allows_password() || self.allows_public_key() || self.allows_certificate()
+    }
+
+    /// Load `path`. A method is enabled only by a valid entry of that kind.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read server config '{}'", path.display()))?;
+        let config = parse_config(&text, path)?;
+        if !config.any_method() {
+            bail!("server config '{}' enables no login method", path.display());
         }
-        (true, _) | (_, true) => bail!("unmatched quote"),
-        _ if raw.contains('"') => bail!("unmatched quote"),
-        _ => Ok(raw.to_string()),
+        Ok(config)
     }
-}
 
-fn section_name(line: &str) -> Option<&str> {
-    let line = line.strip_prefix('[')?.strip_suffix(']')?.trim();
-    if line.is_empty() {
+    /// `publickey` covers both raw keys and OpenSSH user certificates.
+    pub fn method_set(&self) -> MethodSet {
+        let mut methods = Vec::new();
+        if self.allows_password() {
+            methods.push(MethodKind::Password);
+        }
+        if self.allows_public_key() || self.allows_certificate() {
+            methods.push(MethodKind::PublicKey);
+        }
+        MethodSet::from(methods.as_slice())
+    }
+
+    pub fn password_users(&self) -> impl Iterator<Item = &str> {
+        self.passwords.iter().map(|login| login.user.as_str())
+    }
+
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.allows_password() {
+            let users: Vec<_> = self.password_users().collect();
+            parts.push(format!("password ({})", users.join(", ")));
+        }
+        if self.allows_public_key() {
+            parts.push(format!("public key ({} keys)", self.public_keys.len()));
+        }
+        if self.allows_certificate() {
+            parts.push(format!("certificate ({} CAs)", self.ca_fingerprints.len()));
+        }
+        parts.join(", ")
+    }
+
+    pub fn accepts_password(&self, user: &str, password: &str) -> bool {
+        self.passwords.iter().any(|login| {
+            login.user == user && bool::from(login.password.as_bytes().ct_eq(password.as_bytes()))
+        })
+    }
+
+    pub fn accepts_public_key(&self, key: &PublicKey) -> bool {
+        self.public_keys
+            .iter()
+            .any(|allowed| allowed.key_data() == key.key_data())
+    }
+
+    /// `None` means the certificate may log in as `user`.
+    pub fn reject_certificate_reason(
+        &self,
+        user: &str,
+        certificate: &Certificate,
+    ) -> Option<&'static str> {
+        if !certificate.cert_type().is_user() {
+            return Some("not a user certificate");
+        }
+        if !certificate.critical_options().is_empty() {
+            return Some("critical options are not supported");
+        }
+        let principals = certificate.valid_principals();
+        if principals.is_empty() || !principals.iter().any(|principal| principal == user) {
+            return Some("principal does not match the user");
+        }
+        if certificate.validate(self.ca_fingerprints.iter()).is_err() {
+            return Some("CA is not trusted or the certificate is outside its validity window");
+        }
         None
-    } else {
-        Some(line)
+    }
+
+    /// OpenSSH certificate extensions grant capabilities. This server's shell
+    /// implementation always allocates a PTY, so only certificates explicitly
+    /// carrying the empty `permit-pty` extension may request a shell.
+    pub fn certificate_allows_pty(&self, certificate: &Certificate) -> bool {
+        certificate
+            .extensions()
+            .get("permit-pty")
+            .is_some_and(String::is_empty)
     }
 }
+
+// ---------------------------------------------------------------------------
+// CLI parsing and startup resolution
+// ---------------------------------------------------------------------------
 
 /// Command-line values win, then the config file, then the built-in defaults.
 pub struct Listen {
@@ -380,7 +408,7 @@ pub enum CliCommand {
     Run(Cli),
 }
 
-pub const HELP: &str = r#"Usage: sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password password] [--host-key PATH] [--config PATH]
+pub const HELP: &str = r#"Usage: sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password admpass] [--host-key PATH] [--config PATH]
 
 Without --config, only password login is enabled.
 With --config, the file enables each section that contains a valid entry.
@@ -409,6 +437,28 @@ in when it is signed by a listed CA, names that user as a principal, and
 carries no critical options. Shell sessions also require the empty `permit-pty`
 certificate extension; commands and SFTP do not. A relative host-key path in
 the file is resolved from the file's directory. See examples/server.conf."#;
+
+fn take_value<S>(flag: &str, args: &mut impl Iterator<Item = S>) -> Result<String>
+where
+    S: AsRef<str>,
+{
+    let Some(value) = args.next() else {
+        bail!("{flag} requires a value");
+    };
+    let value = value.as_ref();
+    if value.is_empty() || value.starts_with("--") {
+        bail!("{flag} requires a value");
+    }
+    Ok(value.to_string())
+}
+
+fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<()> {
+    if slot.is_some() {
+        bail!("duplicate {flag}");
+    }
+    *slot = Some(value);
+    Ok(())
+}
 
 pub fn parse_cli<I, S>(args: I) -> Result<CliCommand>
 where
@@ -453,36 +503,14 @@ where
     Ok(CliCommand::Run(cli))
 }
 
-fn take_value<S>(flag: &str, args: &mut impl Iterator<Item = S>) -> Result<String>
-where
-    S: AsRef<str>,
-{
-    let Some(value) = args.next() else {
-        bail!("{flag} requires a value");
-    };
-    let value = value.as_ref();
-    if value.is_empty() || value.starts_with("--") {
-        bail!("{flag} requires a value");
-    }
-    Ok(value.to_string())
-}
-
-fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<()> {
-    if slot.is_some() {
-        bail!("duplicate {flag}");
-    }
-    *slot = Some(value);
-    Ok(())
-}
-
 pub fn resolve_startup(cli: &Cli, file: Option<ServerConfig>) -> (Listen, ServerConfig) {
     let config = match file {
         Some(config) => config,
         None => ServerConfig::with_password(
-            cli.user.clone().unwrap_or_else(|| "admin".to_string()),
+            cli.user.clone().unwrap_or_else(|| DEFAULT_USER.to_string()),
             cli.password
                 .clone()
-                .unwrap_or_else(|| "password".to_string()),
+                .unwrap_or_else(|| DEFAULT_PASSWORD.to_string()),
         ),
     };
     let listen = Listen {
@@ -490,40 +518,11 @@ pub fn resolve_startup(cli: &Cli, file: Option<ServerConfig>) -> (Listen, Server
             .host
             .clone()
             .or_else(|| config.host.clone())
-            .unwrap_or_else(|| "0.0.0.0".to_string()),
-        port: cli.port.or(config.port).unwrap_or(2222),
+            .unwrap_or_else(|| DEFAULT_LISTEN_HOST.to_string()),
+        port: cli.port.or(config.port).unwrap_or(DEFAULT_LISTEN_PORT),
         host_key: cli.host_key.clone().or_else(|| config.host_key.clone()),
     };
     (listen, config)
-}
-
-/// Requested path first, then `host_key` beside the executable when it differs.
-pub fn host_key_candidates(requested: Option<&Path>, beside_exe: Option<&Path>) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(path) = requested {
-        paths.push(path.to_path_buf());
-    }
-    if let Some(path) = beside_exe {
-        if !paths.iter().any(|existing| existing == path) {
-            paths.push(path.to_path_buf());
-        }
-    }
-    paths
-}
-
-fn parse_password(line: &str) -> Result<(String, String)> {
-    let Some((user, raw)) = line.split_once('=') else {
-        bail!("password line must be user = \"password\"");
-    };
-    let user = user.trim();
-    if user.is_empty() {
-        bail!("password line is missing a user");
-    }
-    let password = parse_value(raw.trim())?;
-    if password.is_empty() {
-        bail!("password is empty");
-    }
-    Ok((user.to_string(), password))
 }
 
 #[cfg(test)]
@@ -577,16 +576,6 @@ mod tests {
         key.public_key().to_openssh().unwrap().trim().to_string()
     }
 
-    fn user_cert(
-        subject: &PrivateKey,
-        ca: &PrivateKey,
-        principal: Option<&str>,
-        critical: bool,
-        host: bool,
-    ) -> Certificate {
-        user_cert_validity(subject, ca, principal, critical, host, 0, u64::MAX)
-    }
-
     fn user_cert_validity(
         subject: &PrivateKey,
         ca: &PrivateKey,
@@ -618,6 +607,182 @@ mod tests {
         builder.sign(ca).unwrap()
     }
 
+    fn user_cert(
+        subject: &PrivateKey,
+        ca: &PrivateKey,
+        principal: Option<&str>,
+        critical: bool,
+        host: bool,
+    ) -> Certificate {
+        user_cert_validity(subject, ca, principal, critical, host, 0, u64::MAX)
+    }
+
+    /// Entries the test supplies when `examples/server.conf` has deleted a section.
+    /// A section that is still in the file is loaded from that file, including
+    /// commented lines that the parser skips.
+    struct LoginFallback {
+        public_key: PrivateKey,
+        ca: PrivateKey,
+    }
+
+    fn section_present(text: &str, name: &str) -> bool {
+        text.lines().any(|raw| {
+            let line = raw.trim();
+            !line.is_empty() && !line.starts_with('#') && section_name(line) == Some(name)
+        })
+    }
+
+    fn strip_section(text: &str, name: &str) -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for raw in text.lines() {
+            let line = raw.trim();
+            let header = if line.is_empty() || line.starts_with('#') {
+                None
+            } else {
+                section_name(line)
+            };
+            if header == Some(name) {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if header.is_some() {
+                    skipping = false;
+                } else {
+                    continue;
+                }
+            }
+            out.push_str(raw);
+            out.push('\n');
+        }
+        out
+    }
+
+    fn with_missing_sections(text: &str, fallback: &LoginFallback) -> String {
+        let mut text = text.to_string();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        if !section_present(&text, "public_keys") {
+            text.push_str("[public_keys]\n");
+            text.push_str(&openssh(&fallback.public_key));
+            text.push('\n');
+        }
+        if !section_present(&text, "certificates") {
+            text.push_str("[certificates]\n");
+            text.push_str(&openssh(&fallback.ca));
+            text.push('\n');
+        }
+        if !section_present(&text, "passwords") {
+            text.push_str("[passwords]\nalice = \"example-password\"\n");
+        }
+        text
+    }
+
+    struct ScannedLogin {
+        passwords: Vec<(String, String)>,
+        public_keys: Vec<PublicKey>,
+        cas: Vec<PublicKey>,
+    }
+
+    /// Count the same lines the parser keeps: a section stays active until the
+    /// next header, and blank lines and `#` comments are ignored.
+    fn scan_login(text: &str) -> ScannedLogin {
+        let mut section: Option<Section> = None;
+        let mut scanned = ScannedLogin {
+            passwords: Vec::new(),
+            public_keys: Vec::new(),
+            cas: Vec::new(),
+        };
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = section_name(line) {
+                section = match name {
+                    "public_keys" => Some(Section::PublicKeys),
+                    "certificates" => Some(Section::Certificates),
+                    "passwords" => Some(Section::Passwords),
+                    _ => None,
+                };
+                continue;
+            }
+            match section {
+                Some(Section::PublicKeys) => {
+                    scanned
+                        .public_keys
+                        .push(PublicKey::from_openssh(line).unwrap());
+                }
+                Some(Section::Certificates) => {
+                    scanned.cas.push(PublicKey::from_openssh(line).unwrap());
+                }
+                Some(Section::Passwords) => {
+                    scanned.passwords.push(parse_password(line).unwrap());
+                }
+                None => {}
+            }
+        }
+        scanned
+    }
+
+    fn describe_scanned(scanned: &ScannedLogin) -> String {
+        let mut parts = Vec::new();
+        if !scanned.passwords.is_empty() {
+            let users: Vec<_> = scanned
+                .passwords
+                .iter()
+                .map(|(user, _)| user.as_str())
+                .collect();
+            parts.push(format!("password ({})", users.join(", ")));
+        }
+        if !scanned.public_keys.is_empty() {
+            parts.push(format!("public key ({} keys)", scanned.public_keys.len()));
+        }
+        if !scanned.cas.is_empty() {
+            parts.push(format!("certificate ({} CAs)", scanned.cas.len()));
+        }
+        parts.join(", ")
+    }
+
+    fn assert_loaded_login(original: &str, path: &Path, fallback: &LoginFallback) {
+        let text = with_missing_sections(original, fallback);
+        let config = parse_config(&text, path).unwrap();
+        assert!(config.any_method());
+        let scanned = scan_login(&text);
+
+        assert_eq!(config.passwords.len(), scanned.passwords.len());
+        for (user, password) in &scanned.passwords {
+            assert!(config.accepts_password(user, password));
+        }
+        assert_eq!(config.public_keys.len(), scanned.public_keys.len());
+        for key in &scanned.public_keys {
+            assert!(config.accepts_public_key(key));
+        }
+        assert_eq!(config.ca_fingerprints.len(), scanned.cas.len());
+        for ca in &scanned.cas {
+            let fingerprint = ca.fingerprint(HashAlg::Sha256);
+            assert!(config.ca_fingerprints.contains(&fingerprint));
+        }
+        assert_eq!(config.describe(), describe_scanned(&scanned));
+
+        if !section_present(original, "public_keys") {
+            assert!(config.accepts_public_key(fallback.public_key.public_key()));
+        }
+        if !section_present(original, "certificates") {
+            let fingerprint = fallback.ca.public_key().fingerprint(HashAlg::Sha256);
+            assert!(config.ca_fingerprints.contains(&fingerprint));
+        }
+        if !section_present(original, "passwords") {
+            assert!(config.accepts_password("alice", "example-password"));
+        }
+
+        assert_eq!(config.host(), Some("0.0.0.0"));
+        assert_eq!(config.port(), Some(2222));
+        assert_eq!(config.host_key(), None);
+    }
+
     #[test]
     fn file_enables_only_valid_entries_and_keeps_them_independent() {
         let alice = ed25519();
@@ -631,7 +796,7 @@ mod tests {
         let (_dir, path) = write_config(&body);
         let config = ServerConfig::from_file(&path).unwrap();
         assert!(config.accepts_password("bob", "secret with spaces"));
-        assert!(!config.accepts_password("admin", "password"));
+        assert!(!config.accepts_password("admin", "admpass"));
         assert!(config.accepts_public_key(alice.public_key()));
         assert!(!config.accepts_public_key(ed25519().public_key()));
         assert!(config.reject_certificate_reason("alice", &cert).is_none());
@@ -856,173 +1021,6 @@ mod tests {
         drop(dir);
     }
 
-    /// Entries the test supplies when `examples/server.conf` has deleted a section.
-    /// A section that is still in the file is loaded from that file, including
-    /// commented lines that the parser skips.
-    struct LoginFallback {
-        public_key: PrivateKey,
-        ca: PrivateKey,
-    }
-
-    fn section_present(text: &str, name: &str) -> bool {
-        text.lines().any(|raw| {
-            let line = raw.trim();
-            !line.is_empty() && !line.starts_with('#') && section_name(line) == Some(name)
-        })
-    }
-
-    fn strip_section(text: &str, name: &str) -> String {
-        let mut out = String::new();
-        let mut skipping = false;
-        for raw in text.lines() {
-            let line = raw.trim();
-            let header = if line.is_empty() || line.starts_with('#') {
-                None
-            } else {
-                section_name(line)
-            };
-            if header == Some(name) {
-                skipping = true;
-                continue;
-            }
-            if skipping {
-                if header.is_some() {
-                    skipping = false;
-                } else {
-                    continue;
-                }
-            }
-            out.push_str(raw);
-            out.push('\n');
-        }
-        out
-    }
-
-    fn with_missing_sections(text: &str, fallback: &LoginFallback) -> String {
-        let mut text = text.to_string();
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-        if !section_present(&text, "public_keys") {
-            text.push_str("[public_keys]\n");
-            text.push_str(&openssh(&fallback.public_key));
-            text.push('\n');
-        }
-        if !section_present(&text, "certificates") {
-            text.push_str("[certificates]\n");
-            text.push_str(&openssh(&fallback.ca));
-            text.push('\n');
-        }
-        if !section_present(&text, "passwords") {
-            text.push_str("[passwords]\nalice = \"example-password\"\n");
-        }
-        text
-    }
-
-    struct ScannedLogin {
-        passwords: Vec<(String, String)>,
-        public_keys: Vec<PublicKey>,
-        cas: Vec<PublicKey>,
-    }
-
-    /// Count the same lines the parser keeps: a section stays active until the
-    /// next header, and blank lines and `#` comments are ignored.
-    fn scan_login(text: &str) -> ScannedLogin {
-        let mut section: Option<Section> = None;
-        let mut scanned = ScannedLogin {
-            passwords: Vec::new(),
-            public_keys: Vec::new(),
-            cas: Vec::new(),
-        };
-        for raw in text.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(name) = section_name(line) {
-                section = match name {
-                    "public_keys" => Some(Section::PublicKeys),
-                    "certificates" => Some(Section::Certificates),
-                    "passwords" => Some(Section::Passwords),
-                    _ => None,
-                };
-                continue;
-            }
-            match section {
-                Some(Section::PublicKeys) => {
-                    scanned.public_keys.push(PublicKey::from_openssh(line).unwrap());
-                }
-                Some(Section::Certificates) => {
-                    scanned.cas.push(PublicKey::from_openssh(line).unwrap());
-                }
-                Some(Section::Passwords) => {
-                    scanned.passwords.push(parse_password(line).unwrap());
-                }
-                None => {}
-            }
-        }
-        scanned
-    }
-
-    fn describe_scanned(scanned: &ScannedLogin) -> String {
-        let mut parts = Vec::new();
-        if !scanned.passwords.is_empty() {
-            let users: Vec<_> = scanned
-                .passwords
-                .iter()
-                .map(|(user, _)| user.as_str())
-                .collect();
-            parts.push(format!("password ({})", users.join(", ")));
-        }
-        if !scanned.public_keys.is_empty() {
-            parts.push(format!(
-                "public key ({} keys)",
-                scanned.public_keys.len()
-            ));
-        }
-        if !scanned.cas.is_empty() {
-            parts.push(format!("certificate ({} CAs)", scanned.cas.len()));
-        }
-        parts.join(", ")
-    }
-
-    fn assert_loaded_login(original: &str, path: &Path, fallback: &LoginFallback) {
-        let text = with_missing_sections(original, fallback);
-        let config = parse_config(&text, path).unwrap();
-        assert!(config.any_method());
-        let scanned = scan_login(&text);
-
-        assert_eq!(config.passwords.len(), scanned.passwords.len());
-        for (user, password) in &scanned.passwords {
-            assert!(config.accepts_password(user, password));
-        }
-        assert_eq!(config.public_keys.len(), scanned.public_keys.len());
-        for key in &scanned.public_keys {
-            assert!(config.accepts_public_key(key));
-        }
-        assert_eq!(config.ca_fingerprints.len(), scanned.cas.len());
-        for ca in &scanned.cas {
-            let fingerprint = ca.fingerprint(HashAlg::Sha256);
-            assert!(config.ca_fingerprints.contains(&fingerprint));
-        }
-        assert_eq!(config.describe(), describe_scanned(&scanned));
-
-        if !section_present(original, "public_keys") {
-            assert!(config.accepts_public_key(fallback.public_key.public_key()));
-        }
-        if !section_present(original, "certificates") {
-            let fingerprint = fallback.ca.public_key().fingerprint(HashAlg::Sha256);
-            assert!(config.ca_fingerprints.contains(&fingerprint));
-        }
-        if !section_present(original, "passwords") {
-            assert!(config.accepts_password("alice", "example-password"));
-        }
-
-        assert_eq!(config.host(), Some("0.0.0.0"));
-        assert_eq!(config.port(), Some(2222));
-        assert_eq!(config.host_key(), None);
-    }
-
     #[test]
     fn example_config_enables_password_key_and_certificate() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/server.conf");
@@ -1055,7 +1053,7 @@ mod tests {
         assert_eq!(listen.host, "0.0.0.0");
         assert_eq!(listen.port, 2222);
         assert_eq!(listen.host_key, None);
-        assert!(config.accepts_password("admin", "password"));
+        assert!(config.accepts_password("admin", "admpass"));
 
         let CliCommand::Run(cli) = parse_cli([
             "--host",
@@ -1106,21 +1104,5 @@ mod tests {
         assert!(parse_cli(["--port", "1", "--port", "2"]).is_err());
         assert!(parse_cli(["--wat"]).is_err());
         assert!(parse_cli(["--host", ""]).is_err());
-    }
-
-    #[test]
-    fn host_key_candidates_try_the_requested_path_then_the_executable() {
-        let requested = PathBuf::from("requested").join("host_key");
-        let beside = PathBuf::from("exe").join("host_key");
-        assert_eq!(
-            host_key_candidates(Some(&requested), Some(&beside)),
-            vec![requested.clone(), beside.clone()]
-        );
-        assert_eq!(
-            host_key_candidates(Some(&beside), Some(&beside)),
-            vec![beside.clone()]
-        );
-        assert_eq!(host_key_candidates(None, Some(&beside)), vec![beside]);
-        assert!(host_key_candidates(None, None).is_empty());
     }
 }

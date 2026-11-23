@@ -12,8 +12,8 @@ use russh::ChannelMsg;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-use super::AppServer;
-use super::ServerConfig;
+use crate::server_config::{ServerConfig, DEFAULT_PASSWORD, DEFAULT_USER};
+use crate::ssh::SshServer;
 
 /// Capacity of the server channel queue under test. The interactive shell must
 /// discard that copy of each keystroke; otherwise the session blocks here.
@@ -56,7 +56,7 @@ fn client_config() -> Arc<russh::client::Config> {
 }
 
 async fn start_server() -> Result<Running> {
-    start_with(ServerConfig::with_password("admin", "password")).await
+    start_with(ServerConfig::with_password(DEFAULT_USER, DEFAULT_PASSWORD)).await
 }
 
 async fn start_with(auth: ServerConfig) -> Result<Running> {
@@ -72,7 +72,7 @@ async fn start_with(auth: ServerConfig) -> Result<Running> {
         keys: vec![key],
         ..Default::default()
     });
-    let mut server = AppServer {
+    let mut server = SshServer {
         config: Arc::new(auth),
     };
     let task = tokio::spawn(async move {
@@ -99,7 +99,9 @@ async fn handshake(addr: std::net::SocketAddr) -> Result<ClientHandle> {
 
 async fn connect(addr: std::net::SocketAddr) -> Result<ClientHandle> {
     let mut session = handshake(addr).await?;
-    let auth = session.authenticate_password("admin", "password").await?;
+    let auth = session
+        .authenticate_password(DEFAULT_USER, DEFAULT_PASSWORD)
+        .await?;
     if !auth.success() {
         bail!("password authentication failed");
     }
@@ -125,24 +127,6 @@ impl CommandOutput {
             self.code, self.stdout, self.stderr
         )
     }
-}
-
-async fn exec(session: &ClientHandle, command: &str) -> Result<CommandOutput> {
-    let mut channel = session.channel_open_session().await?;
-    channel.exec(true, command.as_bytes()).await?;
-    finish_exec(&mut channel, COMMAND_TIMEOUT).await
-}
-
-async fn exec_with_stdin(
-    session: &ClientHandle,
-    command: &str,
-    stdin: &[u8],
-) -> Result<CommandOutput> {
-    let mut channel = session.channel_open_session().await?;
-    channel.exec(true, command.as_bytes()).await?;
-    channel.data_bytes(stdin.to_vec()).await?;
-    channel.eof().await?;
-    finish_exec(&mut channel, COMMAND_TIMEOUT).await
 }
 
 async fn finish_exec(channel: &mut ClientChannel, timeout: Duration) -> Result<CommandOutput> {
@@ -182,10 +166,43 @@ async fn finish_exec(channel: &mut ClientChannel, timeout: Duration) -> Result<C
     );
 }
 
+async fn exec(session: &ClientHandle, command: &str) -> Result<CommandOutput> {
+    let mut channel = session.channel_open_session().await?;
+    channel.exec(true, command.as_bytes()).await?;
+    finish_exec(&mut channel, COMMAND_TIMEOUT).await
+}
+
+async fn exec_with_stdin(
+    session: &ClientHandle,
+    command: &str,
+    stdin: &[u8],
+) -> Result<CommandOutput> {
+    let mut channel = session.channel_open_session().await?;
+    channel.exec(true, command.as_bytes()).await?;
+    channel.data_bytes(stdin.to_vec()).await?;
+    channel.eof().await?;
+    finish_exec(&mut channel, COMMAND_TIMEOUT).await
+}
+
 /// File name contains a space, so a cmd redirect that splits on whitespace
 /// never creates it. russh drops a client channel on close, so these tests
 /// watch the file instead of the exit status.
 const HEARTBEAT_NAME: &str = "beat file.txt";
+
+/// Escape a cmd metacharacter so it stays inside the redirection target.
+///
+/// Kept on every target: `if cfg!(windows)` still type-checks the Windows
+/// branch when cross-compiling, so this function must exist there too.
+fn cmd_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, ' ' | '&' | '(' | ')' | '^' | '<' | '>' | '|') {
+            escaped.push('^');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
 
 /// Rewrites `path` about once a second until the channel closes.
 ///
@@ -204,21 +221,6 @@ fn heartbeat_command(path: &Path) -> String {
             "i=0; while [ \"$i\" -lt 30 ]; do i=$((i+1)); echo \"$i\" > '{path}'; sleep 1; done"
         )
     }
-}
-
-/// Escape a cmd metacharacter so it stays inside the redirection target.
-///
-/// Kept on every target: `if cfg!(windows)` still type-checks the Windows
-/// branch when cross-compiling, so this function must exist there too.
-fn cmd_escape(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for c in text.chars() {
-        if matches!(c, ' ' | '&' | '(' | ')' | '^' | '<' | '>' | '|') {
-            escaped.push('^');
-        }
-        escaped.push(c);
-    }
-    escaped
 }
 
 async fn wait_for_file(path: &Path, timeout: Duration) -> Result<Vec<u8>> {
@@ -291,6 +293,18 @@ fn term_command() -> &'static str {
     } else {
         r#"printf '%s\n' "$TERM""#
     }
+}
+
+/// ConPTY asks for the cursor with ESC [ 6 n. The four bytes may be split, so
+/// the last three stay in `tail` for the next chunk.
+fn take_cursor_query(tail: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    tail.extend_from_slice(chunk);
+    let saw = tail.windows(4).any(|window| window == b"\x1b[6n");
+    let extra = tail.len().saturating_sub(3);
+    if extra > 0 {
+        tail.drain(..extra).for_each(drop);
+    }
+    saw
 }
 
 struct Shell {
@@ -477,18 +491,6 @@ impl Shell {
     }
 }
 
-/// ConPTY asks for the cursor with ESC [ 6 n. The four bytes may be split, so
-/// the last three stay in `tail` for the next chunk.
-fn take_cursor_query(tail: &mut Vec<u8>, chunk: &[u8]) -> bool {
-    tail.extend_from_slice(chunk);
-    let saw = tail.windows(4).any(|window| window == b"\x1b[6n");
-    let extra = tail.len().saturating_sub(3);
-    if extra > 0 {
-        tail.drain(..extra).for_each(drop);
-    }
-    saw
-}
-
 fn dir_needle(path: &Path) -> String {
     let mut text = path.display().to_string();
     if text.len() > 3 {
@@ -553,19 +555,6 @@ async fn open_scp(
     Ok(channel.into_stream())
 }
 
-async fn read_ok<S>(stream: &mut S) -> Result<()>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut byte = [0u8; 1];
-    stream.read_exact(&mut byte).await?;
-    if byte[0] == 0 {
-        return Ok(());
-    }
-    let line = read_line(stream).await?;
-    bail!("scp server error: {line}")
-}
-
 async fn read_line<S>(stream: &mut S) -> Result<String>
 where
     S: AsyncRead + Unpin,
@@ -582,17 +571,17 @@ where
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-async fn scp_upload_bytes(
-    session: &ClientHandle,
-    remote_path: &Path,
-    name: &str,
-    content: &[u8],
-) -> Result<()> {
-    let mut stream = open_scp(session, "-t", remote_path).await?;
-    read_ok(&mut stream).await?;
-    upload_scp_file(&mut stream, name, content).await?;
-    let _ = stream.shutdown().await;
-    Ok(())
+async fn read_ok<S>(stream: &mut S) -> Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut byte = [0u8; 1];
+    stream.read_exact(&mut byte).await?;
+    if byte[0] == 0 {
+        return Ok(());
+    }
+    let line = read_line(stream).await?;
+    bail!("scp server error: {line}")
 }
 
 async fn upload_scp_file<S>(stream: &mut S, name: &str, content: &[u8]) -> Result<()>
@@ -607,6 +596,19 @@ where
     stream.write_all(&[0]).await?;
     stream.flush().await?;
     read_ok(stream).await
+}
+
+async fn scp_upload_bytes(
+    session: &ClientHandle,
+    remote_path: &Path,
+    name: &str,
+    content: &[u8],
+) -> Result<()> {
+    let mut stream = open_scp(session, "-t", remote_path).await?;
+    read_ok(&mut stream).await?;
+    upload_scp_file(&mut stream, name, content).await?;
+    let _ = stream.shutdown().await;
+    Ok(())
 }
 
 async fn scp_upload_tree(session: &ClientHandle, remote_dir: &Path) -> Result<()> {
@@ -673,6 +675,61 @@ async fn finish_shell_line(
     shell.wait_exit(Duration::from_secs(10)).await
 }
 
+struct DirGuard(PathBuf);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scopeguard_remove(path: PathBuf) -> DirGuard {
+    DirGuard(path)
+}
+
+async fn assert_shell_term(session: &ClientHandle, requested: &str, expected: &str) -> Result<()> {
+    let mut shell = Shell::open(session, requested).await?;
+    let _ = shell.wait_for_output(Duration::from_secs(3)).await;
+    shell.send_line(term_command());
+    shell.send_line("exit");
+    let (text, code) = finish_shell_line(shell, expected, Duration::from_secs(10)).await?;
+    assert!(text.contains(expected), "term output {text:?}");
+    assert_eq!(code, 0, "{text}");
+    Ok(())
+}
+
+/// Records a panic from the shell task. The default Tokio runtime does not
+/// fail a test when a spawned task panics.
+struct PanicWatch {
+    flag: Arc<AtomicBool>,
+}
+
+impl PanicWatch {
+    fn arm() -> Self {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_hook = Arc::clone(&flag);
+        std::panic::set_hook(Box::new(move |info| {
+            flag_hook.store(true, Ordering::SeqCst);
+            eprintln!("task panic: {info}");
+        }));
+        Self { flag }
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.flag.load(Ordering::SeqCst) {
+            bail!("a task panicked while closing the shell");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PanicWatch {
+    fn drop(&mut self) {
+        // `take_hook` puts the default hook back.
+        let _ = std::panic::take_hook();
+    }
+}
+
 #[tokio::test]
 async fn config_file_enables_only_the_methods_it_lists() -> Result<()> {
     use russh::keys::ssh_key::certificate::Builder;
@@ -708,7 +765,7 @@ async fn config_file_enables_only_the_methods_it_lists() -> Result<()> {
 
     let mut session = handshake(server.addr).await?;
     assert!(!session
-        .authenticate_password("admin", "password")
+        .authenticate_password(DEFAULT_USER, DEFAULT_PASSWORD)
         .await?
         .success());
     assert!(!session
@@ -876,25 +933,15 @@ async fn public_key_and_certificate_only_configs_reject_other_methods() -> Resul
     Ok(())
 }
 
-struct DirGuard(PathBuf);
-
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn scopeguard_remove(path: PathBuf) -> DirGuard {
-    DirGuard(path)
-}
-
 #[tokio::test]
 async fn password_auth_accepts_the_configured_user() -> Result<()> {
     let server = start_server().await?;
     let mut session = handshake(server.addr).await?;
-    let rejected = session.authenticate_password("admin", "wrong").await?;
+    let rejected = session.authenticate_password(DEFAULT_USER, "wrong").await?;
     assert!(!rejected.success());
-    let accepted = session.authenticate_password("admin", "password").await?;
+    let accepted = session
+        .authenticate_password(DEFAULT_USER, DEFAULT_PASSWORD)
+        .await?;
     assert!(accepted.success());
     Ok(())
 }
@@ -994,6 +1041,34 @@ async fn legacy_scp_round_trip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn legacy_scp_directory_flag_requires_an_existing_directory() -> Result<()> {
+    let server = start_server().await?;
+    let session = connect(server.addr).await?;
+    let dir = TempDir::new();
+    let existing_dir = dir.path().join("existing-dir");
+    std::fs::create_dir(&existing_dir)?;
+
+    let mut stream = open_scp(&session, "-td", &existing_dir).await?;
+    read_ok(&mut stream).await?;
+    stream.shutdown().await?;
+
+    let target_file = dir.path().join("not-a-directory");
+    std::fs::write(&target_file, b"existing file")?;
+    let mut stream = open_scp(&session, "-td", &target_file).await?;
+    let error = read_ok(&mut stream)
+        .await
+        .expect_err("scp -d must reject a non-directory target");
+    assert!(
+        error
+            .to_string()
+            .contains("target is not an existing directory"),
+        "{error}"
+    );
+    stream.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn shell_prints_client_term_or_the_safe_default() -> Result<()> {
     let _guard = shell_gate().lock().await;
     let server = start_server().await?;
@@ -1003,20 +1078,9 @@ async fn shell_prints_client_term_or_the_safe_default() -> Result<()> {
     Ok(())
 }
 
-async fn assert_shell_term(session: &ClientHandle, requested: &str, expected: &str) -> Result<()> {
-    let mut shell = Shell::open(session, requested).await?;
-    let _ = shell.wait_for_output(Duration::from_secs(3)).await;
-    shell.send_line(term_command());
-    shell.send_line("exit");
-    let (text, code) = finish_shell_line(shell, expected, Duration::from_secs(10)).await?;
-    assert!(text.contains(expected), "term output {text:?}");
-    assert_eq!(code, 0, "{text}");
-    Ok(())
-}
-
 #[tokio::test]
 async fn shell_and_exec_start_in_session_cwd() -> Result<()> {
-    let cwd = super::session_cwd();
+    let cwd = crate::session::session_cwd();
     let server = start_server().await?;
     let session = connect(server.addr).await?;
     let output = exec(&session, cwd_command()).await?;
@@ -1042,7 +1106,7 @@ async fn shell_and_exec_start_in_session_cwd() -> Result<()> {
 #[tokio::test]
 #[cfg(unix)]
 async fn unix_exec_receives_assembled_path() -> Result<()> {
-    let expected = super::unix_path();
+    let expected = crate::session::unix_path();
     let server = start_server().await?;
     let session = connect(server.addr).await?;
     let output = exec(&session, r#"printf %s "$PATH""#).await?;
@@ -1140,9 +1204,12 @@ fn backpressured_shell_close_does_not_exhaust_the_blocking_pool() -> Result<()> 
                 ..Default::default()
             });
             let mut session = russh::client::connect(config, server.addr, AcceptAll).await?;
-            assert!(session.authenticate_password("admin", "password").await?.success());
+            assert!(session
+                .authenticate_password(DEFAULT_USER, DEFAULT_PASSWORD)
+                .await?
+                .success());
             for _ in 0..12 {
-                let cleanups = super::WINDOWS_PTY_CLEANUPS.load(Ordering::SeqCst);
+                let cleanups = crate::session::WINDOWS_PTY_CLEANUPS.load(Ordering::SeqCst);
                 let mut channel = session.channel_open_session().await?;
                 channel.request_pty(true, "xterm", 200, 50, 0, 0, &[]).await?;
                 channel.request_shell(true).await?;
@@ -1154,7 +1221,7 @@ fn backpressured_shell_close_does_not_exhaust_the_blocking_pool() -> Result<()> 
                 channel.close().await?;
                 drop(channel);
                 let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
-                while super::WINDOWS_PTY_CLEANUPS.load(Ordering::SeqCst) == cleanups {
+                while crate::session::WINDOWS_PTY_CLEANUPS.load(Ordering::SeqCst) == cleanups {
                     if tokio::time::Instant::now() >= deadline {
                         bail!("Windows PTY cleanup did not complete after backpressured channel close");
                     }
@@ -1167,38 +1234,6 @@ fn backpressured_shell_close_does_not_exhaust_the_blocking_pool() -> Result<()> 
             }
             Ok(())
         })
-}
-
-/// Records a panic from the shell task. The default Tokio runtime does not
-/// fail a test when a spawned task panics.
-struct PanicWatch {
-    flag: Arc<AtomicBool>,
-}
-
-impl PanicWatch {
-    fn arm() -> Self {
-        let flag = Arc::new(AtomicBool::new(false));
-        let flag_hook = Arc::clone(&flag);
-        std::panic::set_hook(Box::new(move |info| {
-            flag_hook.store(true, Ordering::SeqCst);
-            eprintln!("task panic: {info}");
-        }));
-        Self { flag }
-    }
-
-    fn check(&self) -> Result<()> {
-        if self.flag.load(Ordering::SeqCst) {
-            bail!("a task panicked while closing the shell");
-        }
-        Ok(())
-    }
-}
-
-impl Drop for PanicWatch {
-    fn drop(&mut self) {
-        // `take_hook` puts the default hook back.
-        let _ = std::panic::take_hook();
-    }
 }
 
 /// More separate data messages than the channel queue, then one marker after
@@ -1239,7 +1274,19 @@ async fn sftp_canonicalize_and_another_session_works() -> Result<()> {
     let sftp = russh_sftp::client::SftpSession::new(channel.into_stream()).await?;
     let path = sftp.canonicalize(".").await?;
     assert!(!path.is_empty(), "realpath returned an empty path");
-    drop(sftp);
+
+    let dir = TempDir::new();
+    let file_path = dir.path().join("sftp-roundtrip.bin");
+    let remote_path = file_path.to_string_lossy().into_owned();
+    let payload = b"SFTP async file round-trip\0with binary data\xff";
+    let mut file = sftp.create(&remote_path).await?;
+    file.write_all(payload).await?;
+    file.close().await?;
+
+    let downloaded = sftp.read(&remote_path).await?;
+    assert_eq!(downloaded, payload);
+    sftp.close().await?;
+
     let output = exec(&session, "echo hello-from-server").await?;
     assert_eq!(output.code, 0, "{}", output.summary());
     assert!(

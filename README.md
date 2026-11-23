@@ -78,7 +78,7 @@ chmod +x /var/jb/var/mobile/sshd_standalone
 ## 运行
 
 ```
-sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password password] [--host-key PATH] [--config PATH]
+sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password admpass] [--host-key PATH] [--config PATH]
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -86,7 +86,7 @@ sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password passwo
 | `--host` | `0.0.0.0` | 监听地址 |
 | `--port` | `2222` | 监听端口 |
 | `--user` | `admin` | 登录用户名。有 `--config` 时忽略 |
-| `--password` | `password` | 登录密码。有 `--config` 时忽略 |
+| `--password` | `admpass` | 登录密码。有 `--config` 时忽略 |
 | `--host-key` | 可执行文件旁的 `host_key` | 服务器 Ed25519 主机身份，不是用户登录公钥 |
 | `--config` | 无 | 服务器配置。指定后只启用文件里写对的登录方式 |
 | `--help`、`-h` | | 打印用法后退出，状态码 0 |
@@ -132,6 +132,8 @@ alice = "secret"
 
 工作目录先用存在的 `USERPROFILE`（仅 Windows），再用存在的 `HOME`。都没有时 Windows 用 `C:\`，其他系统用 `/`。登录名不参与选择。
 
+Unix 上子进程的 `PATH` 按可用的平台目录、继承的 `PATH` 条目、可用的标准目录依次组装；空项和重复项会移除。`SHELL` 设为上面选中的 shell。Windows 不重写 `PATH` 或 `SHELL`。
+
 ## 客户端
 
 下面假设服务器是 `192.168.1.100:2222`，用户 `admin`。
@@ -154,8 +156,8 @@ cargo test
 
 测试在进程内启动服务器，覆盖口令、公钥、用户证书、远程命令、经典 SCP、交互式 shell、SFTP，以及通道关闭后的清理。
 
-源码在 `src/main.rs`、`server_config.rs`、`scp.rs`、`sftp.rs`。`session_tests.rs` 只在 `cargo test` 时编译。
+源码在 `src/main.rs`、`server_config.rs`、`host_key.rs`、`ssh.rs`、`session.rs`、`scp.rs`、`sftp.rs`。`session_tests.rs` 只在 `cargo test` 时编译。
 
 ## 安全
 
-默认账号 `admin` / `password` 只在没有 `--config` 时生效，仅用于测试。配置文件里的密码是明文。远程命令会交给上面选定的 shell，不要把服务暴露到不可信网络。主机密钥文件含私钥。
+默认账号 `admin` / `admpass` 只在没有 `--config` 时生效，仅用于测试。配置文件里的密码是明文。远程命令会交给上面选定的 shell，不要把服务暴露到不可信网络。主机密钥文件含私钥。
