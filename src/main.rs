@@ -7,12 +7,12 @@
 //! Usage:
 //!   cargo run -- [--port 2222] [--user admin] [--password admpass] [--config server.conf]
 //!
-//! Without `--config`, only password login is enabled. Defaults: 0.0.0.0:2222,
-//! user "admin", password "admpass". With `--config`, each of `[public_keys]`,
-//! `[certificates]`, and `[passwords]` enables that method when it contains a
-//! valid entry. The command-line password is not used. `host`, `port`, and
-//! `host-key` before any section override those defaults. The same command-line
-//! flags override the file.
+//! Without `--config`, a `server.conf` beside the executable is loaded when
+//! present. Otherwise the server uses password login and defaults to
+//! 0.0.0.0:2222, user "admin", password "admpass". A loaded config file
+//! overrides listen fields it sets; omitted listen fields fall back to CLI and
+//! then defaults. Authentication is file-only, so `--user` and `--password` are
+//! ignored whenever a config is loaded. `--config` explicitly selects the file.
 
 mod host_key;
 mod scp;
@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use russh::server::Server as _;
 use server_config::{
-    parse_cli, resolve_startup, CliCommand, ServerConfig, DEFAULT_LISTEN_HOST, HELP,
+    load_startup_config, parse_cli, resolve_startup, CliCommand, DEFAULT_LISTEN_HOST, HELP,
 };
 use tokio::net::TcpListener;
 
@@ -50,11 +50,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let file = match cli.config.as_deref() {
-        Some(path) => Some(ServerConfig::from_file(path)?),
-        None => None,
+    let file = load_startup_config(cli.config.as_deref())?;
+    let (listen, auth) = match resolve_startup(&cli, file) {
+        Ok(startup) => startup,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
     };
-    let (listen, auth) = resolve_startup(&cli, file);
 
     let (host_key, host_key_path) = host_key::load_or_create_host_key(listen.host_key.as_deref())?;
     if let Some(path) = host_key_path {

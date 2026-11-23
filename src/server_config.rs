@@ -17,6 +17,7 @@ pub const DEFAULT_LISTEN_HOST: &str = "0.0.0.0";
 pub const DEFAULT_LISTEN_PORT: u16 = 2222;
 pub const DEFAULT_USER: &str = "admin";
 pub const DEFAULT_PASSWORD: &str = "admpass";
+const CONFIG_FILE_NAME: &str = "server.conf";
 
 struct PasswordLogin {
     user: String,
@@ -381,11 +382,37 @@ impl ServerConfig {
     }
 }
 
+fn adjacent_config_path(executable_path: &Path) -> Option<PathBuf> {
+    executable_path
+        .parent()
+        .map(|directory| directory.join(CONFIG_FILE_NAME))
+}
+
+fn load_config_from_paths(
+    explicit_path: Option<&Path>,
+    adjacent_path: Option<&Path>,
+) -> Result<Option<ServerConfig>> {
+    let path = match explicit_path {
+        Some(path) => Some(path),
+        None => adjacent_path.filter(|path| path.is_file()),
+    };
+    path.map(ServerConfig::from_file).transpose()
+}
+
+/// Load an explicitly selected config, or automatically use `server.conf`
+/// beside the executable when present. An absent adjacent file means defaults.
+pub fn load_startup_config(explicit_path: Option<&Path>) -> Result<Option<ServerConfig>> {
+    let adjacent_path = std::env::current_exe()
+        .ok()
+        .and_then(|path| adjacent_config_path(&path));
+    load_config_from_paths(explicit_path, adjacent_path.as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // CLI parsing and startup resolution
 // ---------------------------------------------------------------------------
 
-/// Command-line values win, then the config file, then the built-in defaults.
+/// Effective listener settings selected after config-file discovery.
 pub struct Listen {
     pub host: String,
     pub port: u16,
@@ -396,7 +423,8 @@ pub struct Listen {
 #[derive(Default)]
 pub struct Cli {
     pub host: Option<String>,
-    pub port: Option<u16>,
+    /// Kept as text until we know whether a config file makes this value inert.
+    pub port: Option<String>,
     pub user: Option<String>,
     pub password: Option<String>,
     pub host_key: Option<PathBuf>,
@@ -410,12 +438,14 @@ pub enum CliCommand {
 
 pub const HELP: &str = r#"Usage: sshd_standalone [--host 0.0.0.0] [--port 2222] [--user admin] [--password admpass] [--host-key PATH] [--config PATH]
 
-Without --config, only password login is enabled.
-With --config, the file enables each section that contains a valid entry.
---user and --password are not used.
---host, --port, and --host-key override the same settings in the file.
-When both are omitted, the server listens on 0.0.0.0:2222 and stores the
-host key next to the executable.
+--config selects a config file explicitly. Without it, a server.conf beside the
+executable is loaded when present. With a config file, its host, port, host-key,
+and login settings are used. Configured listen fields override matching flags;
+omitted listen fields fall back to command-line values and then defaults.
+Authentication is file-only when a config is loaded; --user and --password are
+ignored.
+Without a config file, command-line values override built-in defaults. The
+server listens on 0.0.0.0:2222 and uses admin/admpass for password login.
 
   host = "0.0.0.0"
   port = 2222
@@ -476,10 +506,7 @@ where
             }
             "--port" => {
                 let value = take_value("--port", &mut args)?;
-                let port = value
-                    .parse::<u16>()
-                    .with_context(|| "--port requires a number from 0 to 65535".to_string())?;
-                set_once(&mut cli.port, "--port", port)?;
+                set_once(&mut cli.port, "--port", value)?;
             }
             "--user" => {
                 let value = take_value("--user", &mut args)?;
@@ -503,26 +530,49 @@ where
     Ok(CliCommand::Run(cli))
 }
 
-pub fn resolve_startup(cli: &Cli, file: Option<ServerConfig>) -> (Listen, ServerConfig) {
-    let config = match file {
-        Some(config) => config,
-        None => ServerConfig::with_password(
-            cli.user.clone().unwrap_or_else(|| DEFAULT_USER.to_string()),
-            cli.password
-                .clone()
-                .unwrap_or_else(|| DEFAULT_PASSWORD.to_string()),
-        ),
+fn parse_cli_port(value: Option<&str>) -> Result<Option<u16>> {
+    value
+        .map(|value| {
+            value
+                .parse::<u16>()
+                .with_context(|| "--port requires a number from 0 to 65535".to_string())
+        })
+        .transpose()
+}
+
+pub fn resolve_startup(cli: &Cli, file: Option<ServerConfig>) -> Result<(Listen, ServerConfig)> {
+    let file_host = file.as_ref().and_then(|config| config.host.as_deref());
+    let file_port = file.as_ref().and_then(|config| config.port);
+    let file_host_key = file.as_ref().and_then(|config| config.host_key.as_deref());
+
+    let host = file_host
+        .or(cli.host.as_deref())
+        .unwrap_or(DEFAULT_LISTEN_HOST)
+        .to_string();
+    let port = match file_port {
+        Some(port) => port,
+        None => parse_cli_port(cli.port.as_deref())?.unwrap_or(DEFAULT_LISTEN_PORT),
     };
-    let listen = Listen {
-        host: cli
-            .host
-            .clone()
-            .or_else(|| config.host.clone())
-            .unwrap_or_else(|| DEFAULT_LISTEN_HOST.to_string()),
-        port: cli.port.or(config.port).unwrap_or(DEFAULT_LISTEN_PORT),
-        host_key: cli.host_key.clone().or_else(|| config.host_key.clone()),
-    };
-    (listen, config)
+    let host_key = file_host_key
+        .or(cli.host_key.as_deref())
+        .map(Path::to_path_buf);
+
+    // Authentication is owned exclusively by the config file when one is loaded.
+    let auth = file.unwrap_or_else(|| {
+        ServerConfig::with_password(
+            cli.user.as_deref().unwrap_or(DEFAULT_USER),
+            cli.password.as_deref().unwrap_or(DEFAULT_PASSWORD),
+        )
+    });
+
+    Ok((
+        Listen {
+            host,
+            port,
+            host_key,
+        },
+        auth,
+    ))
 }
 
 #[cfg(test)]
@@ -943,6 +993,35 @@ mod tests {
     }
 
     #[test]
+    fn startup_config_uses_explicit_path_or_existing_adjacent_file() {
+        let root = TempDir(temp_dir());
+        let executable = root.0.join("bin").join("sshd_standalone.exe");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        let adjacent = adjacent_config_path(&executable).unwrap();
+        std::fs::write(&adjacent, "[passwords]\nadjacent = secret\n").unwrap();
+
+        let explicit = root.0.join("custom.conf");
+        std::fs::write(&explicit, "[passwords]\nexplicit = secret\n").unwrap();
+
+        let selected = load_config_from_paths(Some(&explicit), Some(&adjacent))
+            .unwrap()
+            .expect("explicit config should load");
+        assert!(selected.accepts_password("explicit", "secret"));
+        assert!(!selected.accepts_password("adjacent", "secret"));
+
+        let selected = load_config_from_paths(None, Some(&adjacent))
+            .unwrap()
+            .expect("adjacent config should load");
+        assert!(selected.accepts_password("adjacent", "secret"));
+
+        let missing = root.0.join("missing.conf");
+        assert!(load_config_from_paths(None, Some(&missing))
+            .unwrap()
+            .is_none());
+        assert!(load_config_from_paths(Some(&missing), Some(&adjacent)).is_err());
+    }
+
+    #[test]
     fn server_settings_are_optional_and_paths_are_relative_to_the_config() {
         let (dir, path) = write_config(
             "port = \"2200\"\nhost = 127.0.0.1\nhost-key = \"keys/host_key\"\n\n[passwords]\nalice = \"secret\"\n",
@@ -1045,21 +1124,45 @@ mod tests {
     }
 
     #[test]
-    fn command_line_overrides_the_file_and_defaults_fill_the_rest() {
+    fn no_config_uses_cli_overrides_and_built_in_defaults() {
         let CliCommand::Run(empty) = parse_cli(std::iter::empty::<&str>()).unwrap() else {
             panic!("help");
         };
-        let (listen, config) = resolve_startup(&empty, None);
+        let (listen, config) = resolve_startup(&empty, None).unwrap();
         assert_eq!(listen.host, "0.0.0.0");
         assert_eq!(listen.port, 2222);
         assert_eq!(listen.host_key, None);
         assert!(config.accepts_password("admin", "admpass"));
 
-        let CliCommand::Run(cli) = parse_cli([
+        let CliCommand::Run(cli_overrides) = parse_cli([
             "--host",
             "10.0.0.8",
             "--port",
             "22",
+            "--user",
+            "bob",
+            "--password",
+            "s",
+            "--host-key",
+            "cli-key",
+        ])
+        .unwrap() else {
+            panic!("help");
+        };
+        let (listen, config) = resolve_startup(&cli_overrides, None).unwrap();
+        assert_eq!(listen.host, "10.0.0.8");
+        assert_eq!(listen.port, 22);
+        assert_eq!(listen.host_key.as_deref(), Some(Path::new("cli-key")));
+        assert!(config.accepts_password("bob", "s"));
+    }
+
+    #[test]
+    fn config_file_merges_listen_fields_but_owns_authentication() {
+        let CliCommand::Run(cli_with_bad_port) = parse_cli([
+            "--host",
+            "10.0.0.8",
+            "--port",
+            "not-a-port",
             "--user",
             "bob",
             "--password",
@@ -1072,34 +1175,68 @@ mod tests {
         .unwrap() else {
             panic!("help");
         };
-        let (dir, path) = write_config(
+        let (dir, file_config_path) = write_config(
             "host = \"127.0.0.1\"\nport = 2200\nhost-key = \"keys/host_key\"\n[passwords]\nalice = \"secret\"\n",
         );
-        let file = ServerConfig::from_file(&path).unwrap();
-        let (listen, config) = resolve_startup(&cli, Some(file));
-        assert_eq!(listen.host, "10.0.0.8");
-        assert_eq!(listen.port, 22);
-        assert_eq!(listen.host_key.as_deref(), Some(Path::new("cli-key")));
-        assert!(config.accepts_password("alice", "secret"));
-        assert!(!config.accepts_password("bob", "s"));
-
-        let CliCommand::Run(file_only) =
-            parse_cli(["--config", "server.conf", "--user", "bob"]).unwrap()
-        else {
-            panic!("help");
-        };
-        let file = ServerConfig::from_file(&path).unwrap();
-        let (listen, _) = resolve_startup(&file_only, Some(file));
+        let file = ServerConfig::from_file(&file_config_path).unwrap();
+        let (listen, config) = resolve_startup(&cli_with_bad_port, Some(file)).unwrap();
         assert_eq!(listen.host, "127.0.0.1");
         assert_eq!(listen.port, 2200);
         assert_eq!(
             listen.host_key.as_deref(),
             Some(dir.0.join("keys").join("host_key").as_path())
         );
+        assert!(config.accepts_password("alice", "secret"));
+        assert!(!config.accepts_password("bob", "s"));
+        assert!(resolve_startup(&cli_with_bad_port, None).is_err());
 
+        let CliCommand::Run(cli_overrides) = parse_cli([
+            "--host",
+            "10.0.0.8",
+            "--port",
+            "22",
+            "--user",
+            "bob",
+            "--password",
+            "s",
+            "--host-key",
+            "cli-key",
+        ])
+        .unwrap() else {
+            panic!("help");
+        };
+
+        // Missing listen fields fall back to CLI values, but credentials in the
+        // file remain the only password logins when a config is loaded.
+        let (_listen_fallback_dir, listen_fallback_path) =
+            write_config("[passwords]\nalice = \"secret\"\n");
+        let file = ServerConfig::from_file(&listen_fallback_path).unwrap();
+        let (listen, config) = resolve_startup(&cli_overrides, Some(file)).unwrap();
+        assert_eq!(listen.host, "10.0.0.8");
+        assert_eq!(listen.port, 22);
+        assert_eq!(listen.host_key.as_deref(), Some(Path::new("cli-key")));
+        assert!(config.accepts_password("alice", "secret"));
+        assert!(!config.accepts_password("bob", "s"));
+
+        // When the file omits `port`, an invalid CLI `--port` is still validated.
+        let file = ServerConfig::from_file(&listen_fallback_path).unwrap();
+        assert!(resolve_startup(&cli_with_bad_port, Some(file)).is_err());
+
+        // CLI password credentials do not add password auth to a key-only file.
+        let key = ed25519();
+        let (_key_only_dir, key_only_path) =
+            write_config(&format!("[public_keys]\n{}\n", openssh(&key)));
+        let file = ServerConfig::from_file(&key_only_path).unwrap();
+        let (_, config) = resolve_startup(&cli_overrides, Some(file)).unwrap();
+        assert!(config.accepts_public_key(key.public_key()));
+        assert!(!config.accepts_password("bob", "s"));
+    }
+
+    #[test]
+    fn cli_validation_rejects_malformed_flags_and_defers_port_check() {
         assert!(matches!(parse_cli(["-h"]), Ok(CliCommand::Help)));
         assert!(parse_cli(["--port"]).is_err());
-        assert!(parse_cli(["--port", "nope"]).is_err());
+        assert!(parse_cli(["--port", "nope"]).is_ok());
         assert!(parse_cli(["--host", "--port"]).is_err());
         assert!(parse_cli(["--port", "1", "--port", "2"]).is_err());
         assert!(parse_cli(["--wat"]).is_err());
